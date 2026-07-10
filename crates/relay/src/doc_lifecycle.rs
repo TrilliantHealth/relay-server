@@ -34,8 +34,27 @@ use tokio::sync::{
     oneshot, watch, Mutex as AsyncMutex,
 };
 use y_sweet_core::{
-    doc_sync::DocWithSyncKv, metrics::RelayMetrics, sync::awareness::Awareness, sync_kv::SyncKv,
+    doc_sync::DocWithSyncKv,
+    metrics::RelayMetrics,
+    sync::awareness::Awareness,
+    sync_kv::{PersistOutcome, SyncKv},
 };
+
+/// Result of one actor-supervised persist sub-task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistTaskResult {
+    Persisted,
+    /// The store had changed behind us (a direct write, e.g. a backfill)
+    /// and this persist overwrote it. Written, but worth counting.
+    Clobbered,
+    Failed,
+}
+
+/// Result of one inline flush attempt in the evict/drain loops.
+enum FlushStep {
+    Progress,
+    Error,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachKind {
@@ -243,8 +262,8 @@ struct DocActor {
     idle_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     evict_requested: bool,
     /// At most one persist runs at a time, as a sub-task so the mailbox
-    /// stays responsive. Resolves to whether the persist succeeded.
-    persist_inflight: Option<tokio::task::JoinHandle<bool>>,
+    /// stays responsive.
+    persist_inflight: Option<tokio::task::JoinHandle<PersistTaskResult>>,
     /// A dirty edge arrived while a persist was in flight; schedule a
     /// follow-up when it completes.
     persist_queued: bool,
@@ -319,7 +338,7 @@ impl DocActor {
             Msg(Option<DocMsg>),
             IdleDeadline,
             PersistTimer,
-            PersistDone(bool),
+            PersistDone(PersistTaskResult),
         }
         loop {
             let event = {
@@ -346,7 +365,7 @@ impl DocActor {
                             Some(handle) => handle.await,
                             None => std::future::pending().await,
                         }
-                    } => Event::PersistDone(joined.unwrap_or(false)),
+                    } => Event::PersistDone(joined.unwrap_or(PersistTaskResult::Failed)),
                 }
             };
             match event {
@@ -377,13 +396,24 @@ impl DocActor {
                         self.start_persist();
                     }
                 }
-                Event::PersistDone(ok) => {
+                Event::PersistDone(result) => {
                     self.persist_inflight = None;
-                    if ok {
-                        self.last_persist_ok = tokio::time::Instant::now();
-                        self.persist_backoff = 0;
-                    } else {
-                        self.persist_backoff = (self.persist_backoff + 1).min(8);
+                    match result {
+                        PersistTaskResult::Persisted => {
+                            self.last_persist_ok = tokio::time::Instant::now();
+                            self.persist_backoff = 0;
+                        }
+                        PersistTaskResult::Clobbered => {
+                            // A direct store write landed behind us and this
+                            // persist overwrote it. The write did land, so
+                            // this is a success like any other.
+                            self.metrics.record_doc_persist_conflict();
+                            self.last_persist_ok = tokio::time::Instant::now();
+                            self.persist_backoff = 0;
+                        }
+                        PersistTaskResult::Failed => {
+                            self.persist_backoff = (self.persist_backoff + 1).min(8);
+                        }
                     }
                     if std::mem::take(&mut self.persist_queued) || self.doc.sync_kv().is_dirty() {
                         self.schedule_persist();
@@ -421,11 +451,12 @@ impl DocActor {
         let sync_kv = self.doc.sync_kv();
         let doc_id = self.doc_id.clone();
         self.persist_inflight = Some(tokio::spawn(async move {
-            match sync_kv.persist().await {
-                Ok(()) => true,
+            match sync_kv.persist_checked().await {
+                Ok(PersistOutcome::Persisted) => PersistTaskResult::Persisted,
+                Ok(PersistOutcome::Clobbered) => PersistTaskResult::Clobbered,
                 Err(e) => {
                     tracing::error!(?e, doc_id = %doc_id, "Error persisting");
-                    false
+                    PersistTaskResult::Failed
                 }
             }
         }));
@@ -494,18 +525,13 @@ impl DocActor {
                 self.persist_timer = None;
                 let was_dirty = self.doc.sync_kv().is_dirty();
                 while self.doc.sync_kv().is_dirty() {
-                    let error = self
-                        .doc
-                        .sync_kv()
-                        .persist()
-                        .await
-                        .err()
-                        .map(|e| e.to_string());
-                    if let Some(error) = error {
-                        tracing::error!(%error, doc_id = %self.doc_id, "Error persisting during drain");
-                        // The process is dying; keep trying until the
-                        // platform kill timeout bounds us, but don't spin.
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    match self.flush_once().await {
+                        FlushStep::Progress => {}
+                        FlushStep::Error => {
+                            // The process is dying; keep trying until the
+                            // platform kill timeout bounds us, don't spin.
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
                     }
                 }
                 self.last_persist_ok = tokio::time::Instant::now();
@@ -513,6 +539,30 @@ impl DocActor {
                 false
             }
             DocMsg::Evict { reply } => self.handle_evict(reply).await,
+        }
+    }
+
+    /// One inline flush attempt for the evict/drain loops: persist with
+    /// the lease check, overwriting — and counting — a direct store write
+    /// that landed behind us.
+    async fn flush_once(&mut self) -> FlushStep {
+        // Stringify the error eagerly: the boxed store error is not Send.
+        let outcome = self
+            .doc
+            .sync_kv()
+            .persist_checked()
+            .await
+            .map_err(|e| e.to_string());
+        match outcome {
+            Ok(PersistOutcome::Persisted) => FlushStep::Progress,
+            Ok(PersistOutcome::Clobbered) => {
+                self.metrics.record_doc_persist_conflict();
+                FlushStep::Progress
+            }
+            Err(error) => {
+                tracing::error!(%error, doc_id = %self.doc_id, "Error persisting during flush");
+                FlushStep::Error
+            }
         }
     }
 
@@ -563,17 +613,20 @@ impl DocActor {
         // the registry clears the slot, or a reload would read a stale
         // snapshot and its next persist would roll the doc back. A doc
         // never leaves memory unflushed: persistent store failure keeps
-        // it resident and retries on the next idle deadline.
+        // it resident and retries on the next idle deadline. A direct
+        // store write landing mid-eviction is overwritten and counted.
         let mut failures = 0;
         while self.doc.sync_kv().is_dirty() {
-            if let Err(e) = self.doc.sync_kv().persist().await {
-                failures += 1;
-                tracing::error!(?e, doc_id = %self.doc_id, "Error persisting during eviction");
-                if failures >= 3 {
-                    self.metrics.record_lifecycle_transition("evicting", "idle");
-                    self.arm_idle_deadline();
-                    let _ = reply.send(EvictOutcome::Refused);
-                    return false;
+            match self.flush_once().await {
+                FlushStep::Progress => {}
+                FlushStep::Error => {
+                    failures += 1;
+                    if failures >= 3 {
+                        self.metrics.record_lifecycle_transition("evicting", "idle");
+                        self.arm_idle_deadline();
+                        let _ = reply.send(EvictOutcome::Refused);
+                        return false;
+                    }
                 }
             }
         }
@@ -1378,6 +1431,124 @@ mod tests {
                 "round {round}: eviction must fully reclaim the slot"
             );
         }
+    }
+
+    /// A direct store write landing under a live doc is detected and
+    /// overwritten: for a resident doc the server's in-memory state is the
+    /// authority. The clobber is counted so it is visible in metrics.
+    #[tokio::test(start_paused = true)]
+    async fn direct_store_write_is_clobbered_by_live_persist() {
+        let metrics = test_metrics();
+        let store = MemoryStore::new();
+        let registry = DocRegistry::new(
+            metrics.clone(),
+            LifecycleConfig {
+                checkpoint_freq: Duration::from_secs(10),
+                doc_gc: false,
+            },
+        );
+        let loader = || {
+            let store = store.clone();
+            async move { load_doc(&store, "doc").await }
+        };
+
+        let guard = registry
+            .attach("doc", AttachKind::Socket, loader)
+            .await
+            .unwrap();
+        guard
+            .doc()
+            .apply_update(&content_update("live", "1"))
+            .unwrap();
+
+        // An operator backfill: a separate handle over the same store
+        // key, writing directly (plain overwrite, as tools do). The live
+        // doc's lease is now stale.
+        let backfill = load_doc(&store, "doc").await.unwrap();
+        backfill
+            .apply_update(&content_update("backfill", "1"))
+            .unwrap();
+        backfill.sync_kv().persist().await.unwrap();
+
+        // The live doc's throttled persist detects the direct write and
+        // overwrites it.
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        settle().await;
+
+        assert_eq!(
+            metrics
+                .doc_persist_conflicts_total
+                .with_label_values(&[])
+                .get(),
+            1.0,
+            "the clobber must be observed"
+        );
+        assert_eq!(
+            read_content(guard.doc(), "backfill"),
+            None,
+            "the direct write is not folded into the live doc"
+        );
+
+        // The store holds the live doc's state alone after eviction.
+        drop(guard);
+        settle().await;
+        assert_eq!(registry.evict("doc").await, EvictOutcome::Evicted);
+        let reloaded = registry.get_or_load("doc", loader).await.unwrap();
+        assert_eq!(read_content(&reloaded, "live").as_deref(), Some("1"));
+        assert_eq!(
+            read_content(&reloaded, "backfill"),
+            None,
+            "the direct write was overwritten"
+        );
+    }
+
+    /// Same behavior at the idle-entry flush: a direct write that landed
+    /// while a connection was live is overwritten at its detach.
+    #[tokio::test(start_paused = true)]
+    async fn direct_store_write_is_clobbered_by_idle_entry_flush() {
+        let metrics = test_metrics();
+        let store = MemoryStore::new();
+        let registry = DocRegistry::new(metrics.clone(), no_gc());
+        let loader = || {
+            let store = store.clone();
+            async move { load_doc(&store, "doc").await }
+        };
+
+        let guard = registry
+            .attach("doc", AttachKind::Socket, loader)
+            .await
+            .unwrap();
+        guard
+            .doc()
+            .apply_update(&content_update("live", "1"))
+            .unwrap();
+
+        let backfill = load_doc(&store, "doc").await.unwrap();
+        backfill
+            .apply_update(&content_update("backfill", "1"))
+            .unwrap();
+        backfill.sync_kv().persist().await.unwrap();
+
+        // The detach's idle-entry flush detects the direct write and
+        // overwrites it.
+        drop(guard);
+        settle().await;
+
+        assert!(
+            metrics
+                .doc_persist_conflicts_total
+                .with_label_values(&[])
+                .get()
+                >= 1.0
+        );
+        assert_eq!(registry.evict("doc").await, EvictOutcome::Evicted);
+        let reloaded = registry.get_or_load("doc", loader).await.unwrap();
+        assert_eq!(read_content(&reloaded, "live").as_deref(), Some("1"));
+        assert_eq!(
+            read_content(&reloaded, "backfill"),
+            None,
+            "the direct write was overwritten"
+        );
     }
 
     /// The actor owns the checkpoint throttle: bursts of dirtiness within

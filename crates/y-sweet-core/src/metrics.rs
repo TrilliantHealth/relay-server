@@ -34,6 +34,7 @@ pub struct RelayMetrics {
 
     // Document lifecycle metrics
     pub doc_lifecycle_transitions_total: CounterVec,
+    pub doc_persist_conflicts_total: CounterVec,
 }
 
 static RELAY_METRICS: OnceLock<Result<Arc<RelayMetrics>, prometheus::Error>> = OnceLock::new();
@@ -239,6 +240,18 @@ impl RelayMetrics {
         )?;
         registry.register(Box::new(doc_lifecycle_transitions_total.clone()))?;
 
+        let doc_persist_conflicts_total = CounterVec::new(
+            Opts::new(
+                "relay_server_doc_persist_conflicts_total",
+                "Lease-checked persists that found the backing object changed behind the server (a direct store write, e.g. a backfill). Each one was merged into the live doc and re-persisted rather than overwritten",
+            ),
+            &[],
+        )?;
+        registry.register(Box::new(doc_persist_conflicts_total.clone()))?;
+        // Touch so it exports 0 from startup; "no conflicts" must be
+        // distinguishable from "no data".
+        doc_persist_conflicts_total.with_label_values(&[]);
+
         Ok(Arc::new(Self {
             webhook_requests_total,
             webhook_request_duration_seconds,
@@ -260,6 +273,7 @@ impl RelayMetrics {
             websocket_send_failures_total,
             doc_dirty_at_drain_total,
             doc_lifecycle_transitions_total,
+            doc_persist_conflicts_total,
         }))
     }
 
@@ -385,6 +399,12 @@ impl RelayMetrics {
     pub fn record_lifecycle_transition(&self, from: &str, to: &str) {
         self.doc_lifecycle_transitions_total
             .with_label_values(&[from, to])
+            .inc();
+    }
+
+    pub fn record_doc_persist_conflict(&self) {
+        self.doc_persist_conflicts_total
+            .with_label_values(&[])
             .inc();
     }
 

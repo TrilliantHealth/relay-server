@@ -107,6 +107,15 @@ where
     BTreeMap::from_cbor_value(cbor_value).map_err(D::Error::custom)
 }
 
+/// Result of a lease-checked persist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistOutcome {
+    Persisted,
+    /// The backing object had changed behind us (an operator tool wrote
+    /// to the store directly) and this persist overwrote that write.
+    Clobbered,
+}
+
 pub struct SyncKv {
     data: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
     store: Option<Arc<Box<dyn Store>>>,
@@ -246,6 +255,45 @@ impl SyncKv {
 
     pub async fn persist(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.persist_inner(false).await
+    }
+
+    /// Persist with the write lease as a compare-and-set. The lease is a
+    /// detector, not a fence: if the backing object changed since we last
+    /// read or wrote it (an operator tool writing directly to the store),
+    /// warn that the direct write is being overwritten and write anyway,
+    /// reporting `Clobbered`. For a resident doc the server's in-memory
+    /// state is the authority.
+    pub async fn persist_checked(&self) -> Result<PersistOutcome, Box<dyn std::error::Error>> {
+        let has_lease = self.write_lease.lock().unwrap().is_some();
+        if self.store.is_some() && has_lease {
+            // Settle the first attempt before awaiting again: the boxed
+            // store error is not Send, and holding one across the retry's
+            // await would make this future non-Send and unspawnable.
+            match self.persist_inner(true).await {
+                Ok(()) => return Ok(PersistOutcome::Persisted),
+                Err(e) => match e.downcast::<crate::store::StoreError>() {
+                    Ok(store_err)
+                        if matches!(*store_err, crate::store::StoreError::LeaseConflict(_)) => {}
+                    Ok(store_err) => return Err(store_err),
+                    Err(other) => return Err(other),
+                },
+            }
+            tracing::warn!(
+                key = %self.key,
+                "store changed behind this persist; overwriting the direct write"
+            );
+            // The failed lease check left the doc dirty, so the
+            // unconditional retry re-snapshots and takes a fresh lease
+            // for the next window.
+            self.persist_inner(false).await?;
+            Ok(PersistOutcome::Clobbered)
+        } else {
+            // Storeless docs (tests, ephemeral mode) have nothing to
+            // conflict with.
+            self.persist_inner(false)
+                .await
+                .map(|_| PersistOutcome::Persisted)
+        }
     }
 
     /// Persist this document only if the backing object still matches the
