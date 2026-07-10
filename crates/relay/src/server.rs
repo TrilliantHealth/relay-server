@@ -26,10 +26,9 @@ use std::{io::Write, sync::Arc, time::Duration};
 use tempfile::NamedTempFile;
 use tokio::{
     net::TcpListener,
-    sync::mpsc::{channel, error::TrySendError, Receiver},
+    sync::mpsc::{channel, error::TrySendError},
 };
-use tokio_util::{sync::CancellationToken, task::TaskTracker};
-use tracing::{span, Instrument, Level};
+use tokio_util::sync::CancellationToken;
 use url::Url;
 use y_sweet_core::{
     api_types::{
@@ -46,7 +45,6 @@ use y_sweet_core::{
     },
     metrics::RelayMetrics,
     store::Store,
-    sync_kv::SyncKv,
     webhook::WebhookConfig,
 };
 
@@ -228,9 +226,7 @@ pub struct Server {
     /// Owner of document identity: single-flight loads, eviction under
     /// the slot lock, slots reclaimed at eviction and on failed loads.
     registry: Arc<DocRegistry>,
-    doc_worker_tracker: TaskTracker,
     store: Option<Arc<Box<dyn Store>>>,
-    checkpoint_freq: Duration,
     authenticator: Option<Authenticator>,
     url: Option<Url>,
     allowed_hosts: Vec<AllowedHost>,
@@ -301,9 +297,7 @@ impl Server {
                     doc_gc,
                 },
             )),
-            doc_worker_tracker: TaskTracker::new(),
             store: store.map(Arc::new),
-            checkpoint_freq,
             authenticator,
             url,
             allowed_hosts,
@@ -333,19 +327,8 @@ impl Server {
     /// workers are the status-quo multi-writer behavior; the actor
     /// migration serializes per-doc writes later.
     pub async fn flush_all_docs(&self) {
-        let docs = self.registry.resident_docs();
         let started = std::time::Instant::now();
-        let mut flushed = 0usize;
-        for doc in docs {
-            let sync_kv = doc.sync_kv();
-            if !sync_kv.is_dirty() {
-                continue;
-            }
-            match sync_kv.persist().await {
-                Ok(()) => flushed += 1,
-                Err(e) => tracing::error!(?e, "Error persisting during pre-close flush"),
-            }
-        }
+        let flushed = self.registry.drain().await;
         tracing::info!(
             "pre-close flush: {} dirty docs persisted in {} ms",
             flushed,
@@ -353,17 +336,15 @@ impl Server {
         );
     }
 
-    /// Wait for every per-doc worker to finish. The persistence workers
-    /// run one final unthrottled persist when the server token cancels,
-    /// so returning means the flush is fully on the store.
-    pub async fn drain_doc_workers(&self) {
-        let docs = self.registry.len();
+    /// Post-cutover delta flush: with sockets closed, drain repeatedly
+    /// until every resident doc is clean, so exiting immediately after
+    /// this returns loses nothing.
+    pub async fn flush_until_clean(&self) {
         let started = std::time::Instant::now();
-        self.doc_worker_tracker.close();
-        self.doc_worker_tracker.wait().await;
+        let flushed = self.registry.flush_until_clean().await;
         tracing::info!(
-            "final flush: {} docs persisted in {} ms",
-            docs,
+            "final flush: {} dirty docs persisted in {} ms",
+            flushed,
             started.elapsed().as_millis()
         );
     }
@@ -438,8 +419,6 @@ impl Server {
         routing_channel: Option<String>,
         user: Option<String>,
     ) -> Result<DocWithSyncKv> {
-        let (send, recv) = channel(1024);
-
         // Determine routing channel: use provided channel or fallback to doc_id
         let routing_channel_name = routing_channel
             .clone()
@@ -465,28 +444,27 @@ impl Server {
             let event_dispatcher = self.event_dispatcher.clone();
             let routing_channel_for_callback = routing_channel_name.clone();
             let user_for_callback = user.clone();
-            let registry = self.registry.clone();
             let doc_id_for_callback = doc_id.to_string();
             // The parent pin lives in this closure, which the doc owns via
             // its SyncKv observer: the guard detaches when the doc drops.
-            let _parent_guard = parent_guard;
+            let parent_guard = parent_guard;
 
             if let Some(dispatcher) = event_dispatcher {
                 Some(Arc::new(move |mut event: DocumentUpdatedEvent| {
-                    // Keep the parent pin alive by referencing it in the closure
-                    let _ = &_parent_guard;
                     // Add user to event if available
                     if let Some(ref user) = user_for_callback {
                         event.user = Some(user.clone());
                     }
 
-                    // Update parent's subdoc snapshot index
-                    if routing_channel_for_callback != doc_id_for_callback {
+                    // Route this subdoc's snapshot through the parent's
+                    // actor mailbox — cross-doc mutation stays with the
+                    // owner. The guard doubles as the parent pin.
+                    if let Some(parent_guard) = &parent_guard {
                         if let Some(snapshot) = &event.snapshot {
-                            if let Some(parent) = registry.peek(&routing_channel_for_callback) {
-                                parent
-                                    .update_subdoc_snapshot(&doc_id_for_callback, snapshot.clone());
-                            }
+                            parent_guard.send_subdoc_snapshot(
+                                doc_id_for_callback.clone(),
+                                snapshot.clone(),
+                            );
                         }
                     }
 
@@ -514,18 +492,9 @@ impl Server {
             }
         };
 
-        let dwskv = DocWithSyncKv::new(
-            doc_id,
-            self.store.clone(),
-            move || {
-                // Best-effort wake: after eviction the persistence worker is
-                // gone and the channel is closed; the teardown-time persist()
-                // covers those writes instead of a panic here.
-                let _ = send.try_send(());
-            },
-            event_callback,
-        )
-        .await?;
+        // The dirty callback is a placeholder until the registry spawns
+        // this doc's lifecycle actor and points the edge at its mailbox.
+        let dwskv = DocWithSyncKv::new(doc_id, self.store.clone(), || (), event_callback).await?;
 
         // If channel is provided in token, store it in document metadata
         if let Some(channel_name) = routing_channel {
@@ -538,86 +507,7 @@ impl Server {
             .await
             .map_err(|e| anyhow!("Error persisting: {:?}", e))?;
 
-        {
-            let sync_kv = dwskv.sync_kv();
-            let checkpoint_freq = self.checkpoint_freq;
-            let doc_id = doc_id.to_string();
-            let cancellation_token = self.cancellation_token.clone();
-
-            // Spawn a task to save the document to the store when it changes.
-            self.doc_worker_tracker.spawn(
-                Self::doc_persistence_worker(
-                    recv,
-                    sync_kv,
-                    checkpoint_freq,
-                    doc_id.clone(),
-                    cancellation_token.clone(),
-                )
-                .instrument(span!(Level::INFO, "save_loop", doc_id=?doc_id)),
-            );
-        }
-
         Ok(dwskv)
-    }
-
-    async fn doc_persistence_worker(
-        mut recv: Receiver<()>,
-        sync_kv: Arc<SyncKv>,
-        checkpoint_freq: Duration,
-        doc_id: String,
-        cancellation_token: CancellationToken,
-    ) {
-        let mut last_save = std::time::Instant::now();
-
-        loop {
-            let is_done = tokio::select! {
-                v = recv.recv() => v.is_none(),
-                _ = cancellation_token.cancelled() => true,
-                _ = tokio::time::sleep(checkpoint_freq) => {
-                    sync_kv.is_shutdown()
-                }
-            };
-
-            tracing::debug!("Received signal. done: {}", is_done);
-            let now = std::time::Instant::now();
-            if !is_done && now - last_save < checkpoint_freq {
-                let sleep = tokio::time::sleep(checkpoint_freq - (now - last_save));
-                tokio::pin!(sleep);
-                tracing::debug!("Throttling.");
-
-                loop {
-                    tokio::select! {
-                        _ = &mut sleep => {
-                            break;
-                        }
-                        v = recv.recv() => {
-                            tracing::debug!("Received dirty while throttling.");
-                            if v.is_none() {
-                                break;
-                            }
-                        }
-                        _ = cancellation_token.cancelled() => {
-                            tracing::debug!("Received cancellation while throttling.");
-                            break;
-                        }
-
-                    }
-                    tracing::debug!("Done throttling.");
-                }
-            }
-            tracing::debug!("Persisting.");
-            if let Err(e) = sync_kv.persist().await {
-                tracing::error!(?e, "Error persisting.");
-            } else {
-                tracing::debug!("Done persisting.");
-            }
-            last_save = std::time::Instant::now();
-
-            if is_done {
-                break;
-            }
-        }
-        tracing::debug!("Terminating loop for {}", doc_id);
     }
 
     pub async fn get_or_create_doc(&self, doc_id: &str) -> Result<Arc<DocWithSyncKv>> {
@@ -824,14 +714,14 @@ impl Server {
 
         tracing::info!("HTTP server stopped, shutting down event dispatcher...");
 
-        // Explicitly shutdown event dispatcher before waiting on doc workers
+        // Explicitly shutdown event dispatcher before the final doc flush
         if let Some(event_dispatcher) = &self.event_dispatcher {
             tracing::info!("Shutting down event dispatcher...");
             event_dispatcher.shutdown();
             tracing::info!("Event dispatcher shutdown complete");
         }
 
-        self.drain_doc_workers().await;
+        self.flush_until_clean().await;
 
         Ok(())
     }
@@ -2568,6 +2458,7 @@ mod test {
     use y_sweet_core::api_types::Authorization;
     use y_sweet_core::auth::ExpirationTimeEpochMillis;
     use y_sweet_core::sync::awareness::Awareness;
+    use y_sweet_core::sync_kv::SyncKv;
 
     #[tokio::test]
     async fn test_auth_doc() {
@@ -2609,7 +2500,7 @@ mod test {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn drain_doc_workers_completes_after_cancel() {
+    async fn flush_until_clean_completes_despite_throttle() {
         let token = CancellationToken::new();
         let server = Server::new(
             None,
@@ -2624,15 +2515,22 @@ mod test {
         .await
         .unwrap();
 
-        // A live doc spawns persistence (and gc) workers; despite the 60s
-        // checkpoint throttle, cancellation must run the final persist and
-        // let the drain return promptly.
-        server.create_doc().await.unwrap();
-        token.cancel();
+        // Despite the 60s checkpoint throttle holding a dirty doc, the
+        // shutdown drain must flush it and return promptly.
+        let doc_id = server.create_doc().await.unwrap();
+        let dwskv = server.get_or_create_doc(&doc_id).await.unwrap();
+        let mut meta = std::collections::BTreeMap::new();
+        meta.insert(
+            "k".to_string(),
+            ciborium::value::Value::Text("v".to_string()),
+        );
+        dwskv.sync_kv().set_metadata(meta);
+        assert!(dwskv.sync_kv().is_dirty());
 
-        tokio::time::timeout(Duration::from_secs(5), server.drain_doc_workers())
+        tokio::time::timeout(Duration::from_secs(5), server.flush_until_clean())
             .await
-            .expect("doc workers did not finish their final persist");
+            .expect("the shutdown drain did not finish the final persist");
+        assert!(!dwskv.sync_kv().is_dirty());
     }
 
     #[tokio::test]
@@ -3169,12 +3067,10 @@ mod test {
         assert!(response.download_url.contains(&format!("token={}", token)));
     }
 
-    /// Test that persistence workers terminate when docs are garbage collected.
-    /// This is a regression test for the memory leak fixed in PR #401.
+    /// An idle doc with no attachments ages out on its own, and its slot
+    /// is fully reclaimed — no per-doc residue survives eviction.
     #[tokio::test(start_paused = true)]
-    async fn test_persistence_worker_terminates_on_gc() {
-        // Paused time auto-advances through the worker sleeps, so the
-        // checkpoint frequency costs nothing in wall-clock terms.
+    async fn idle_doc_ages_out_and_slot_is_reclaimed() {
         let checkpoint_freq = Duration::from_millis(50);
 
         let server = Arc::new(
@@ -3192,34 +3088,16 @@ mod test {
             .unwrap(),
         );
 
-        // Create a doc - this spawns persistence and GC workers
         let doc_id = server.create_doc().await.unwrap();
-
-        // Verify the doc exists
         assert!(server.registry.is_resident(&doc_id));
 
-        // The doc has no external references (we're not holding an awareness Arc),
-        // so it should be eligible for GC after 2 checkpoint intervals.
-        // Wait for GC to happen (2 intervals + some buffer)
+        // No attachments: the idle deadline (2×checkpoint_freq) evicts.
         tokio::time::sleep(checkpoint_freq * 5).await;
-
-        // Doc should be removed by GC
         assert!(
             !server.registry.is_resident(&doc_id),
-            "Doc should have been garbage collected"
+            "an unattached doc should age out on the idle deadline"
         );
-
-        // Close the tracker and wait for all workers to finish.
-        // If persistence workers don't terminate (the bug), this will hang.
-        server.doc_worker_tracker.close();
-
-        let wait_result =
-            tokio::time::timeout(Duration::from_secs(2), server.doc_worker_tracker.wait()).await;
-
-        assert!(
-            wait_result.is_ok(),
-            "Persistence workers should terminate after GC, but they hung"
-        );
+        assert_eq!(server.registry.len(), 0, "the slot must be reclaimed");
     }
 
     /// Characterization tests for the current document lifecycle. These pin
@@ -3350,6 +3228,45 @@ mod test {
             assert!(
                 !server.registry.is_resident(parent_id),
                 "parent pin leaked after the last subdoc was evicted"
+            );
+        }
+
+        /// A subdoc's snapshot reaches the parent's metadata index through
+        /// the parent actor's mailbox — cross-doc mutation stays with the
+        /// owner.
+        #[tokio::test(start_paused = true)]
+        async fn subdoc_snapshot_routed_via_parent_mailbox() {
+            let store = MemoryStore::new();
+            let server = test_server(
+                Some(Box::new(store.clone())),
+                Duration::from_secs(600),
+                false,
+                CancellationToken::new(),
+            )
+            .await;
+
+            server
+                .get_or_create_doc_with_channel("child-doc", Some("parent-doc".to_string()))
+                .await
+                .unwrap();
+            let child = server.get_or_create_doc("child-doc").await.unwrap();
+            child.apply_update(&content_update("k", "v")).unwrap();
+
+            // The child's update event carries a snapshot to the parent
+            // actor; let both mailboxes settle.
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+
+            let parent = server.registry.peek("parent-doc").unwrap();
+            let has_subdoc_index = parent
+                .sync_kv()
+                .get_metadata()
+                .map(|meta| meta.contains_key("subdocs"))
+                .unwrap_or(false);
+            assert!(
+                has_subdoc_index,
+                "the parent's subdoc snapshot index must be updated via its actor"
             );
         }
 

@@ -101,10 +101,22 @@ pub enum DocMsg {
     Detach {
         kind: AttachKind,
     },
-    #[allow(dead_code)] // authoritative once the actor owns the throttle
+    /// Wake-up hint from the doc's clean→dirty edge; the dirty bit is the
+    /// truth and every flush decision re-reads it.
     Dirty,
+    /// A subdoc pushing its snapshot into this (parent) doc's metadata
+    /// index — cross-doc mutation goes through the owner's mailbox.
+    UpdateSubdocSnapshot {
+        child_id: String,
+        snapshot: Vec<u8>,
+    },
     Evict {
         reply: oneshot::Sender<EvictOutcome>,
+    },
+    /// Process-drain flush: persist until clean and report whether there
+    /// was anything to flush. The doc stays resident.
+    Drain {
+        reply: oneshot::Sender<bool>,
     },
 }
 
@@ -188,6 +200,15 @@ impl AttachGuard {
     pub fn doc(&self) -> &Arc<DocWithSyncKv> {
         &self.doc
     }
+
+    /// Route a subdoc's snapshot to this doc's actor (the guard here is a
+    /// `Subdoc` pin held on the parent). Best-effort: a dead parent actor
+    /// means the parent is gone and the snapshot has nowhere to live.
+    pub fn send_subdoc_snapshot(&self, child_id: String, snapshot: Vec<u8>) {
+        let _ = self
+            .tx
+            .send(DocMsg::UpdateSubdocSnapshot { child_id, snapshot });
+    }
 }
 
 impl Drop for AttachGuard {
@@ -221,9 +242,17 @@ struct DocActor {
     /// Armed while idle (and `doc_gc`); firing sends one `EvictRequest`.
     idle_deadline: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     evict_requested: bool,
-    /// The idle-entry flush runs as a sub-task so the mailbox stays
-    /// responsive; eviction awaits it before its own flush.
-    persist_inflight: Option<tokio::task::JoinHandle<()>>,
+    /// At most one persist runs at a time, as a sub-task so the mailbox
+    /// stays responsive. Resolves to whether the persist succeeded.
+    persist_inflight: Option<tokio::task::JoinHandle<bool>>,
+    /// A dirty edge arrived while a persist was in flight; schedule a
+    /// follow-up when it completes.
+    persist_queued: bool,
+    /// Armed when a dirty doc is inside the throttle window (or backing
+    /// off after a persist error).
+    persist_timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    last_persist_ok: tokio::time::Instant,
+    persist_backoff: u32,
     cfg: LifecycleConfig,
     metrics: Arc<RelayMetrics>,
 }
@@ -253,12 +282,21 @@ impl DocActor {
             idle_deadline: None,
             evict_requested: false,
             persist_inflight: None,
+            persist_queued: false,
+            persist_timer: None,
+            last_persist_ok: tokio::time::Instant::now(),
+            persist_backoff: 0,
             cfg,
             metrics,
         };
         // A doc is born idle: loads that never attach (doc creation,
         // warm-ups) age out on the same deadline as any other idle doc.
         actor.arm_idle_deadline();
+        // The dirty callback is rewired to this actor only after the doc
+        // is constructed; catch any edge that fired before the rewire.
+        if actor.doc.sync_kv().is_dirty() {
+            actor.schedule_persist();
+        }
         tokio::spawn(actor.run());
         DocHandle {
             tx,
@@ -277,33 +315,53 @@ impl DocActor {
     }
 
     async fn run(mut self) {
+        enum Event {
+            Msg(Option<DocMsg>),
+            IdleDeadline,
+            PersistTimer,
+            PersistDone(bool),
+        }
         loop {
             let event = {
                 let deadline = &mut self.idle_deadline;
+                let timer = &mut self.persist_timer;
+                let inflight = &mut self.persist_inflight;
                 let mailbox = &mut self.mailbox;
                 tokio::select! {
-                    msg = mailbox.recv() => Some(msg),
+                    msg = mailbox.recv() => Event::Msg(msg),
                     _ = async {
                         match deadline {
                             Some(sleep) => sleep.as_mut().await,
                             None => std::future::pending().await,
                         }
-                    } => None,
+                    } => Event::IdleDeadline,
+                    _ = async {
+                        match timer {
+                            Some(sleep) => sleep.as_mut().await,
+                            None => std::future::pending().await,
+                        }
+                    } => Event::PersistTimer,
+                    joined = async {
+                        match inflight {
+                            Some(handle) => handle.await,
+                            None => std::future::pending().await,
+                        }
+                    } => Event::PersistDone(joined.unwrap_or(false)),
                 }
             };
             match event {
                 // Slot dropped and every guard gone; nothing left to own.
-                Some(None) => break,
-                Some(Some(msg)) => {
+                Event::Msg(None) => break,
+                Event::Msg(Some(msg)) => {
                     if self.handle_msg(msg).await {
                         break;
                     }
                 }
-                None => {
-                    // Idle deadline fired: hand the decision to the
-                    // registry, which serializes eviction under the slot
-                    // mutex. Do not re-arm; the request stays pending
-                    // until an `Evict` (or an attach) resolves it.
+                Event::IdleDeadline => {
+                    // Hand the decision to the registry, which serializes
+                    // eviction under the slot mutex. Do not re-arm; the
+                    // request stays pending until an `Evict` (or an
+                    // attach) resolves it.
                     self.idle_deadline = None;
                     if !self.evict_requested {
                         self.evict_requested = true;
@@ -313,8 +371,64 @@ impl DocActor {
                         });
                     }
                 }
+                Event::PersistTimer => {
+                    self.persist_timer = None;
+                    if self.persist_inflight.is_none() && self.doc.sync_kv().is_dirty() {
+                        self.start_persist();
+                    }
+                }
+                Event::PersistDone(ok) => {
+                    self.persist_inflight = None;
+                    if ok {
+                        self.last_persist_ok = tokio::time::Instant::now();
+                        self.persist_backoff = 0;
+                    } else {
+                        self.persist_backoff = (self.persist_backoff + 1).min(8);
+                    }
+                    if std::mem::take(&mut self.persist_queued) || self.doc.sync_kv().is_dirty() {
+                        self.schedule_persist();
+                    }
+                }
             }
         }
+    }
+
+    /// Persist now if the throttle window allows it, otherwise arm the
+    /// timer for the window boundary (with exponential backoff after
+    /// persist errors, whose failure path never re-fires the dirty edge).
+    fn schedule_persist(&mut self) {
+        if self.persist_inflight.is_some() {
+            self.persist_queued = true;
+            return;
+        }
+        if !self.doc.sync_kv().is_dirty() {
+            return;
+        }
+        let backoff = self
+            .cfg
+            .checkpoint_freq
+            .saturating_mul(1 << self.persist_backoff.min(8));
+        let due = self.last_persist_ok + backoff;
+        if tokio::time::Instant::now() >= due {
+            self.start_persist();
+        } else if self.persist_timer.is_none() {
+            self.persist_timer = Some(Box::pin(tokio::time::sleep_until(due)));
+        }
+    }
+
+    fn start_persist(&mut self) {
+        self.persist_timer = None;
+        let sync_kv = self.doc.sync_kv();
+        let doc_id = self.doc_id.clone();
+        self.persist_inflight = Some(tokio::spawn(async move {
+            match sync_kv.persist().await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::error!(?e, doc_id = %doc_id, "Error persisting");
+                    false
+                }
+            }
+        }));
     }
 
     /// Returns true when the actor should exit (the doc was evicted).
@@ -363,27 +477,58 @@ impl DocActor {
                 );
                 false
             }
-            DocMsg::Dirty => false,
+            DocMsg::Dirty => {
+                self.schedule_persist();
+                false
+            }
+            DocMsg::UpdateSubdocSnapshot { child_id, snapshot } => {
+                // Mutating our own metadata marks the doc dirty, whose
+                // edge callback enqueues a Dirty for the throttle.
+                self.doc.update_subdoc_snapshot(&child_id, snapshot);
+                false
+            }
+            DocMsg::Drain { reply } => {
+                if let Some(inflight) = self.persist_inflight.take() {
+                    let _ = inflight.await;
+                }
+                self.persist_timer = None;
+                let was_dirty = self.doc.sync_kv().is_dirty();
+                while self.doc.sync_kv().is_dirty() {
+                    let error = self
+                        .doc
+                        .sync_kv()
+                        .persist()
+                        .await
+                        .err()
+                        .map(|e| e.to_string());
+                    if let Some(error) = error {
+                        tracing::error!(%error, doc_id = %self.doc_id, "Error persisting during drain");
+                        // The process is dying; keep trying until the
+                        // platform kill timeout bounds us, but don't spin.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+                self.last_persist_ok = tokio::time::Instant::now();
+                let _ = reply.send(was_dirty);
+                false
+            }
             DocMsg::Evict { reply } => self.handle_evict(reply).await,
         }
     }
 
     /// Idle entry is a durability point: the machine may be suspended any
     /// time after the last connection drains, so whatever the checkpoint
-    /// throttle is still holding gets flushed now, as a sub-task that
-    /// keeps the mailbox responsive.
+    /// throttle is still holding gets flushed now, bypassing the window.
     fn idle_entry_flush(&mut self) {
         if !self.doc.sync_kv().is_dirty() {
             return;
         }
         self.metrics.record_doc_dirty_at_drain();
-        let sync_kv = self.doc.sync_kv();
-        let doc_id = self.doc_id.clone();
-        self.persist_inflight = Some(tokio::spawn(async move {
-            if let Err(e) = sync_kv.persist().await {
-                tracing::error!(?e, doc_id = %doc_id, "Error persisting at idle entry");
-            }
-        }));
+        if self.persist_inflight.is_some() {
+            self.persist_queued = true;
+        } else {
+            self.start_persist();
+        }
     }
 
     async fn handle_evict(&mut self, reply: oneshot::Sender<EvictOutcome>) -> bool {
@@ -396,6 +541,7 @@ impl DocActor {
             return false;
         }
         self.idle_deadline = None;
+        self.persist_timer = None;
         self.metrics.record_lifecycle_transition("idle", "evicting");
         if let Some(inflight) = self.persist_inflight.take() {
             let _ = inflight.await;
@@ -432,10 +578,6 @@ impl DocActor {
             }
         }
         self.metrics.record_lifecycle_transition("evicting", "gone");
-        // Transitional, until the actor owns the persistence throttle:
-        // the per-doc persistence worker polls this flag to learn its doc
-        // is gone and exit.
-        self.doc.sync_kv().shutdown();
         let _ = reply.send(EvictOutcome::Evicted);
         // Returning true drops the actor and with it the doc instance.
         true
@@ -691,6 +833,14 @@ impl DocRegistry {
                         self.metrics.clone(),
                         self.ctl_tx.clone(),
                     );
+                    // Point the doc's dirty edge at its actor, which
+                    // owns the persistence throttle. The actor re-checks
+                    // the dirty bit at spawn, covering edges that fired
+                    // before this rewire.
+                    let dirty_tx = handle.tx.clone();
+                    doc.sync_kv().set_dirty_callback(Box::new(move || {
+                        let _ = dirty_tx.send(DocMsg::Dirty);
+                    }));
                     let resident = Resident { doc, handle };
                     slot.state.write().unwrap().doc = Some(resident.clone());
                     return Ok(resident);
@@ -701,6 +851,56 @@ impl DocRegistry {
                     return Err(err);
                 }
             }
+        }
+    }
+
+    /// One drain pass: broadcast a flush to every resident doc's actor
+    /// and await the results. Returns how many docs had dirty state to
+    /// flush. Docs stay resident; nothing about their lifecycle changes.
+    pub async fn drain(&self) -> usize {
+        let residents: Vec<Resident> = self
+            .slots
+            .iter()
+            .filter_map(|entry| entry.value().state.read().unwrap().doc.clone())
+            .collect();
+        let mut replies = Vec::with_capacity(residents.len());
+        for resident in residents {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if resident
+                .handle
+                .tx
+                .send(DocMsg::Drain { reply: reply_tx })
+                .is_ok()
+            {
+                replies.push(reply_rx);
+            }
+        }
+        let mut flushed = 0;
+        for reply in replies {
+            if let Ok(true) = reply.await {
+                flushed += 1;
+            }
+        }
+        flushed
+    }
+
+    /// Drain until no resident doc is dirty. Used after the socket
+    /// cutover at shutdown: detaches enqueued behind a drain pass can
+    /// dirty-flush after it, so repeat until quiescent. With sockets
+    /// closed there are no writers, so this terminates.
+    pub async fn flush_until_clean(&self) -> usize {
+        let mut total = 0;
+        loop {
+            total += self.drain().await;
+            let any_dirty = self
+                .slots
+                .iter()
+                .filter_map(|entry| entry.value().state.read().unwrap().doc.clone())
+                .any(|resident| resident.doc.sync_kv().is_dirty());
+            if !any_dirty {
+                return total;
+            }
+            tokio::task::yield_now().await;
         }
     }
 
@@ -1177,6 +1377,173 @@ mod tests {
                 0,
                 "round {round}: eviction must fully reclaim the slot"
             );
+        }
+    }
+
+    /// The actor owns the checkpoint throttle: bursts of dirtiness within
+    /// one checkpoint window coalesce into a single store PUT.
+    #[tokio::test(start_paused = true)]
+    async fn active_persists_throttle_to_checkpoint_freq() {
+        let store = GatedStore::new();
+        let registry = DocRegistry::new(
+            test_metrics(),
+            LifecycleConfig {
+                checkpoint_freq: Duration::from_secs(10),
+                doc_gc: false,
+            },
+        );
+        let loader = || {
+            let store = store.clone();
+            async move { load_doc(&store, "doc").await }
+        };
+
+        let guard = registry
+            .attach("doc", AttachKind::Socket, loader)
+            .await
+            .unwrap();
+        let key = "doc/data.ysweet";
+
+        // A burst of writes inside one window.
+        for i in 0..5 {
+            guard
+                .doc()
+                .apply_update(&content_update(&format!("k{i}"), "v"))
+                .unwrap();
+        }
+        settle().await;
+        assert_eq!(
+            store.put_count(key),
+            0,
+            "writes inside the window must wait for the throttle"
+        );
+
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        assert_eq!(
+            store.put_count(key),
+            1,
+            "one window of writes must coalesce into one PUT"
+        );
+
+        // A second window.
+        guard
+            .doc()
+            .apply_update(&content_update("later", "v"))
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        assert_eq!(store.put_count(key), 2);
+        assert!(store.stored(key).is_some());
+    }
+
+    /// A write racing an in-flight persist schedules a follow-up: the
+    /// second write's bytes reach the store, single-writer, no loss.
+    #[tokio::test(start_paused = true)]
+    async fn dirty_during_inflight_persist_schedules_followup() {
+        let store = GatedStore::new();
+        let registry = DocRegistry::new(
+            test_metrics(),
+            LifecycleConfig {
+                checkpoint_freq: Duration::from_secs(10),
+                doc_gc: false,
+            },
+        );
+        let loader = || {
+            let store = store.clone();
+            async move { load_doc(&store, "doc").await }
+        };
+
+        let guard = registry
+            .attach("doc", AttachKind::Socket, loader)
+            .await
+            .unwrap();
+        let key = "doc/data.ysweet";
+
+        guard
+            .doc()
+            .apply_update(&content_update("k1", "v1"))
+            .unwrap();
+        store.close_gate();
+        // Reach the throttle boundary: the persist starts and parks on
+        // the gate.
+        tokio::time::sleep(Duration::from_secs(11)).await;
+
+        // Dirty the doc while the persist is in flight.
+        guard
+            .doc()
+            .apply_update(&content_update("k2", "v2"))
+            .unwrap();
+        settle().await;
+
+        store.release(1);
+        // The follow-up persist runs after the next throttle window.
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        store.open_gate();
+        settle().await;
+
+        assert_eq!(
+            store.put_count(key),
+            2,
+            "the racing write must get its own follow-up persist"
+        );
+        let reloaded = registry.evict("doc").await;
+        assert_eq!(reloaded, EvictOutcome::Refused, "guard still held");
+        drop(guard);
+        settle().await;
+        assert_eq!(registry.evict("doc").await, EvictOutcome::Evicted);
+        let fresh = registry
+            .get_or_load("doc", || {
+                let store = store.clone();
+                async move { load_doc(&store, "doc").await }
+            })
+            .await
+            .unwrap();
+        assert_eq!(read_content(&fresh, "k2").as_deref(), Some("v2"));
+    }
+
+    /// The drain broadcast flushes every dirty doc without waiting on the
+    /// throttle and without evicting anything.
+    #[tokio::test(start_paused = true)]
+    async fn drain_broadcast_flushes_all_dirty_docs() {
+        let store = MemoryStore::new();
+        let registry = DocRegistry::new(
+            test_metrics(),
+            LifecycleConfig {
+                checkpoint_freq: Duration::from_secs(600),
+                doc_gc: false,
+            },
+        );
+
+        let mut guards = Vec::new();
+        for name in ["a", "b", "c"] {
+            let store = store.clone();
+            let guard = registry
+                .attach(name, AttachKind::Socket, move || {
+                    let store = store.clone();
+                    let name = name.to_string();
+                    async move { load_doc(&store, &name).await }
+                })
+                .await
+                .unwrap();
+            guards.push(guard);
+        }
+        guards[0]
+            .doc()
+            .apply_update(&content_update("k", "v"))
+            .unwrap();
+        guards[1]
+            .doc()
+            .apply_update(&content_update("k", "v"))
+            .unwrap();
+
+        let flushed = registry.drain().await;
+        assert_eq!(flushed, 2, "both dirty docs must flush");
+        assert!(store.get_bytes("a/data.ysweet").is_some());
+        assert!(store.get_bytes("b/data.ysweet").is_some());
+        assert!(
+            store.get_bytes("c/data.ysweet").is_none(),
+            "a clean doc has nothing to flush"
+        );
+        for name in ["a", "b", "c"] {
+            assert!(registry.is_resident(name), "drain must not evict");
         }
     }
 

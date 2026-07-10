@@ -112,8 +112,9 @@ pub struct SyncKv {
     store: Option<Arc<Box<dyn Store>>>,
     key: String,
     dirty: AtomicBool,
-    dirty_callback: Box<dyn Fn() + Send + Sync>,
-    shutdown: AtomicBool,
+    /// Fired on every clean→dirty transition. Rewireable so the lifecycle
+    /// layer can point it at a doc's actor after construction.
+    dirty_callback: RwLock<Box<dyn Fn() + Send + Sync>>,
     created_at: Option<u64>,
     write_lease: Arc<Mutex<Option<WriteLease>>>,
     metadata: Arc<RwLock<Option<BTreeMap<String, ciborium::value::Value>>>>,
@@ -177,8 +178,7 @@ impl SyncKv {
             store,
             key,
             dirty: AtomicBool::new(false),
-            dirty_callback: Box::new(callback),
-            shutdown: AtomicBool::new(false),
+            dirty_callback: RwLock::new(Box::new(callback)),
             created_at,
             write_lease: Arc::new(Mutex::new(write_lease)),
             metadata: Arc::new(RwLock::new(metadata)),
@@ -219,8 +219,7 @@ impl SyncKv {
             store: None,
             key: key_str,
             dirty: AtomicBool::new(false),
-            dirty_callback: Box::new(|| ()),
-            shutdown: AtomicBool::new(false),
+            dirty_callback: RwLock::new(Box::new(|| ())),
             created_at,
             write_lease: Arc::new(Mutex::new(None)),
             metadata: Arc::new(RwLock::new(metadata)),
@@ -229,15 +228,20 @@ impl SyncKv {
     }
 
     fn mark_dirty(&self) {
-        // Writes after shutdown still mark dirty: a connection that raced
-        // eviction and kept writing must leave persist() something to
-        // save. The callback wake is best-effort — the persistence worker
-        // may already be gone — so the write's durability rests on the
-        // explicit persist() at connection teardown.
+        // The callback fires only on the clean→dirty edge and is a
+        // wake-up hint; the dirty bit itself is the durability truth that
+        // every flush decision re-reads.
         if !self.dirty.load(Ordering::Relaxed) {
             self.dirty.store(true, Ordering::Relaxed);
-            (self.dirty_callback)();
+            (self.dirty_callback.read().unwrap())();
         }
+    }
+
+    /// Repoint the dirty callback (e.g. at a doc's lifecycle actor once
+    /// it exists). Callers that may have missed edges fired before the
+    /// rewire should re-check `is_dirty` afterwards.
+    pub fn set_dirty_callback(&self, callback: Box<dyn Fn() + Send + Sync>) {
+        *self.dirty_callback.write().unwrap() = callback;
     }
 
     pub async fn persist(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -329,19 +333,9 @@ impl SyncKv {
         self.data.lock().unwrap().is_empty()
     }
 
-    pub fn is_shutdown(&self) -> bool {
-        self.shutdown.load(Ordering::SeqCst)
-    }
-
     /// Whether local state has changes the store has not seen.
     pub fn is_dirty(&self) -> bool {
         self.dirty.load(Ordering::Relaxed)
-    }
-
-    pub fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-        // Call the callback one last time to wake up the persistence worker
-        (self.dirty_callback)();
     }
 
     /// Set metadata for this document

@@ -991,12 +991,13 @@ async fn main() -> Result<()> {
             // Beat 1: flush every dirty doc while sockets keep serving —
             // the slow store work happens before any client notices.
             server.flush_all_docs().await;
-            // Beat 2: cutover. Close doc sockets and cancel the workers;
-            // their final persists cover only the delta written during
-            // the flush, so this is bounded by a handful of PUTs.
+            // Beat 2: cutover. Close doc sockets; their detaches trigger
+            // idle-entry flushes, and the delta drain repeats until every
+            // doc is clean — bounded by a handful of PUTs since beat 1
+            // already did the slow work.
             server.close_doc_sockets();
             token.cancel();
-            server.drain_doc_workers().await;
+            server.flush_until_clean().await;
             // Beat 3: exit now. Deliberately do NOT await the HTTP drain:
             // a bound listener that refuses upgrades eats into the
             // reconnect budget of every client it turns away.
