@@ -447,9 +447,13 @@ impl DocConnection {
                         }
                         result
                     } else {
-                        Err(sync::Error::PermissionDenied {
-                            reason: "Token does not have write access".to_string(),
-                        })
+                        // A read-only connection may not push document state.
+                        // Answer with a permission-denied control message so an
+                        // honest client can surface the refusal, rather than the
+                        // write being dropped without any reply to the sender.
+                        Ok(Some(Message::Auth(Some(
+                            "Token does not have write access".to_string(),
+                        ))))
                     }
                 }
                 SyncMessage::Update(update) => {
@@ -469,9 +473,13 @@ impl DocConnection {
                         }
                         result
                     } else {
-                        Err(sync::Error::PermissionDenied {
-                            reason: "Token does not have write access".to_string(),
-                        })
+                        // A read-only connection may not push document state.
+                        // Answer with a permission-denied control message so an
+                        // honest client can surface the refusal, rather than the
+                        // write being dropped without any reply to the sender.
+                        Ok(Some(Message::Auth(Some(
+                            "Token does not have write access".to_string(),
+                        ))))
                     }
                 }
             },
@@ -1378,5 +1386,92 @@ mod tests {
         let result = connection.handle_msg(&DefaultProtocol, update);
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    /// Build a real, non-empty document update from a throwaway doc.
+    fn sample_update() -> Vec<u8> {
+        let source = yrs::Doc::new();
+        {
+            let map = source.get_or_insert_map("m");
+            let mut txn = source.transact_mut();
+            map.insert(&mut txn, "k", "v");
+        }
+        let txn = source.transact();
+        let update = txn.encode_state_as_update_v1(&yrs::StateVector::default());
+        drop(txn);
+        update
+    }
+
+    #[test]
+    fn test_read_only_write_answered_with_permission_denied() {
+        let doc = yrs::Doc::new();
+        let awareness = Arc::new(RwLock::new(Awareness::new(doc)));
+        let connection = DocConnection::new(awareness.clone(), Authorization::ReadOnly, |_| {});
+        let update = sample_update();
+
+        // A non-empty SyncStep2 on a read-only connection is answered with a
+        // permission-denied control message — not applied, and not an error.
+        let reply = connection
+            .handle_msg(
+                &DefaultProtocol,
+                Message::Sync(SyncMessage::SyncStep2(update.clone())),
+            )
+            .unwrap();
+        assert_eq!(
+            reply,
+            Some(Message::Auth(Some(
+                "Token does not have write access".to_string()
+            )))
+        );
+
+        // The same holds for a continuous Update message.
+        let reply = connection
+            .handle_msg(&DefaultProtocol, Message::Sync(SyncMessage::Update(update)))
+            .unwrap();
+        assert_eq!(
+            reply,
+            Some(Message::Auth(Some(
+                "Token does not have write access".to_string()
+            )))
+        );
+
+        // The refused write left the room document untouched.
+        let sv = awareness.read().unwrap().doc().transact().state_vector();
+        assert!(
+            sv.is_empty(),
+            "a read-only write must not mutate the room doc"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_full_token_write_emits_no_permission_denied() {
+        let doc = yrs::Doc::new();
+        let awareness = Arc::new(RwLock::new(Awareness::new(doc)));
+        let sent = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let sink = sent.clone();
+        let connection = DocConnection::new(awareness.clone(), Authorization::Full, move |bytes| {
+            sink.lock().unwrap().push(bytes.to_vec());
+        });
+
+        // A full-scoped write is accepted and never answered with a
+        // permission-denied control message.
+        connection
+            .send(&Message::Sync(SyncMessage::Update(sample_update())).encode_v1())
+            .await
+            .unwrap();
+
+        let emitted_auth = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| matches!(Message::decode_v1(m), Ok(Message::Auth(_))));
+        assert!(
+            !emitted_auth,
+            "a full-token write must not emit a permission-denied message"
+        );
+
+        // The full-scoped write was applied to the room document.
+        let sv = awareness.read().unwrap().doc().transact().state_vector();
+        assert!(!sv.is_empty(), "a full-token write must be applied");
     }
 }
