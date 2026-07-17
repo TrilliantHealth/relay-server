@@ -5,7 +5,7 @@ use crate::sync::{
 };
 use crate::sync_kv::SyncKv;
 use std::collections::HashSet;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use yrs::{
     block::ClientID,
     encoding::write::Write,
@@ -13,7 +13,7 @@ use yrs::{
         decoder::Decode,
         encoder::{Encode, Encoder, EncoderV1},
     },
-    Array, Map, Out, ReadTxn, Subscription, Transact, Update,
+    Array, Map, Out, ReadTxn, StateVector, Subscription, Transact, Update,
 };
 
 fn current_time_epoch_millis() -> u64 {
@@ -58,6 +58,32 @@ fn deleted_spans_by_client<T: ReadTxn>(txn: &T) -> std::collections::HashMap<Cli
         .collect()
 }
 
+/// Result of processing one message from a sync client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendOutcome {
+    Processed,
+    /// The first client state for a previously empty document has been
+    /// integrated. The caller must make the document durable, then call
+    /// [`DocConnection::finish_initial_sync`] before reading another client
+    /// message.
+    InitialSyncNeedsDurability,
+}
+
+/// The server and client both initiate y-sync, so their SyncStep1/SyncStep2
+/// pairs can cross. For a document that was empty when the connection opened,
+/// don't let the server's SyncStep2 acknowledge provider sync until the
+/// reciprocal client state has arrived and the owner has made it durable.
+enum InitialSync {
+    NotRequired,
+    AwaitingClientState {
+        deferred_client_state_vector: Option<StateVector>,
+    },
+    AwaitingDurability {
+        deferred_client_state_vector: Option<StateVector>,
+    },
+    Complete,
+}
+
 pub struct DocConnection {
     awareness: Arc<RwLock<Awareness>>,
     #[allow(unused)] // acts as RAII guard
@@ -88,6 +114,8 @@ pub struct DocConnection {
 
     /// Document ID, for log context only.
     doc_id: Option<String>,
+
+    initial_sync: Mutex<InitialSync>,
 }
 
 impl DocConnection {
@@ -159,19 +187,21 @@ impl DocConnection {
     ) -> Self {
         let closed = Arc::new(OnceLock::new());
 
-        let (doc_subscription, awareness_subscription) = {
+        let (doc_subscription, awareness_subscription, server_was_empty) = {
             let mut awareness = awareness.write().unwrap();
 
             // Initial handshake is based on this:
             // https://github.com/y-crdt/y-sync/blob/56958e83acfd1f3c09f5dd67cf23c9c72f000707/src/sync.rs#L45-L54
 
-            {
+            let server_was_empty = {
                 // Send a server-side state vector, so that the client can send
                 // updates that happened offline.
                 let sv = awareness.doc().transact().state_vector();
+                let server_was_empty = sv.is_empty();
                 let sync_step_1 = Message::Sync(SyncMessage::SyncStep1(sv)).encode_v1();
                 callback(&sync_step_1);
-            }
+                server_was_empty
+            };
 
             {
                 // Send the initial awareness state.
@@ -221,7 +251,15 @@ impl DocConnection {
                 }
             });
 
-            (doc_subscription, awareness_subscription)
+            (doc_subscription, awareness_subscription, server_was_empty)
+        };
+
+        let initial_sync = if server_was_empty && matches!(authorization, Authorization::Full) {
+            InitialSync::AwaitingClientState {
+                deferred_client_state_vector: None,
+            }
+        } else {
+            InitialSync::NotRequired
         };
 
         Self {
@@ -237,11 +275,24 @@ impl DocConnection {
             sync_kv: None,
             user: None,
             doc_id: None,
+            initial_sync: Mutex::new(initial_sync),
         }
     }
 
-    /// Set the SyncKv reference for subdoc snapshot queries
+    /// Set the SyncKv reference for subdoc snapshot queries. An unpersisted
+    /// resident document may be the result of an earlier initial-sync
+    /// connection that disappeared before persistence completed, so a new
+    /// writable connection must inherit the same durability gate instead of
+    /// acknowledging the merely resident state.
     pub fn set_sync_kv(&mut self, sync_kv: Arc<SyncKv>) {
+        if sync_kv.has_unpersisted_changes() && matches!(self.authorization, Authorization::Full) {
+            let mut initial_sync = self.initial_sync.lock().unwrap();
+            if matches!(*initial_sync, InitialSync::NotRequired) {
+                *initial_sync = InitialSync::AwaitingClientState {
+                    deferred_client_state_vector: None,
+                };
+            }
+        }
         self.sync_kv = Some(sync_kv);
     }
 
@@ -391,13 +442,34 @@ impl DocConnection {
         }
     }
 
-    pub async fn send(&self, update: &[u8]) -> Result<(), anyhow::Error> {
+    pub async fn send(&self, update: &[u8]) -> Result<SendOutcome, anyhow::Error> {
         // Check expiration before processing
         if self.is_expired() {
             return Err(anyhow::Error::msg("Token expired"));
         }
 
         let msg = Message::decode_v1(update)?;
+
+        // A client's SyncStep1 can arrive before its response to the
+        // server-initiated SyncStep1. Hold our SyncStep2 until that reciprocal
+        // client state has been applied and persisted by the document owner.
+        if let Message::Sync(SyncMessage::SyncStep1(state_vector)) = &msg {
+            let mut initial_sync = self.initial_sync.lock().unwrap();
+            match &mut *initial_sync {
+                InitialSync::AwaitingClientState {
+                    deferred_client_state_vector,
+                }
+                | InitialSync::AwaitingDurability {
+                    deferred_client_state_vector,
+                } => {
+                    *deferred_client_state_vector = Some(state_vector.clone());
+                    return Ok(SendOutcome::Processed);
+                }
+                InitialSync::NotRequired | InitialSync::Complete => {}
+            }
+        }
+
+        let is_sync_step_2 = matches!(&msg, Message::Sync(SyncMessage::SyncStep2(_)));
         let result = self.handle_msg(&DefaultProtocol, msg)?;
 
         if let Some(result) = result {
@@ -405,6 +477,49 @@ impl DocConnection {
             (self.callback)(&msg);
         }
 
+        if is_sync_step_2 {
+            let mut initial_sync = self.initial_sync.lock().unwrap();
+            if let InitialSync::AwaitingClientState {
+                deferred_client_state_vector,
+            } = &mut *initial_sync
+            {
+                let deferred_client_state_vector = deferred_client_state_vector.take();
+                *initial_sync = InitialSync::AwaitingDurability {
+                    deferred_client_state_vector,
+                };
+                return Ok(SendOutcome::InitialSyncNeedsDurability);
+            }
+        }
+
+        Ok(SendOutcome::Processed)
+    }
+
+    /// Complete the initial handshake after the document owner has made the
+    /// first integrated client state durable. If the client's SyncStep1 was
+    /// already received, this emits the deferred server SyncStep2.
+    pub fn finish_initial_sync(&self) -> Result<(), anyhow::Error> {
+        let deferred_client_state_vector = {
+            let initial_sync = self.initial_sync.lock().unwrap();
+            match &*initial_sync {
+                InitialSync::AwaitingDurability {
+                    deferred_client_state_vector,
+                } => deferred_client_state_vector.clone(),
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "initial sync is not waiting for durability"
+                    ));
+                }
+            }
+        };
+
+        if let Some(state_vector) = deferred_client_state_vector {
+            let awareness = self.awareness.read().unwrap();
+            if let Some(response) = DefaultProtocol.handle_sync_step1(&awareness, state_vector)? {
+                (self.callback)(&response.encode_v1());
+            }
+        }
+
+        *self.initial_sync.lock().unwrap() = InitialSync::Complete;
         Ok(())
     }
 

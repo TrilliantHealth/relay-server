@@ -1900,6 +1900,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "tokio-tungstenite",
  "tokio-util",
  "toml",
  "tracing",

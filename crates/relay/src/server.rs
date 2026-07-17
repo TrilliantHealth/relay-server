@@ -37,7 +37,7 @@ use y_sweet_core::{
         FileHistoryEntry, FileHistoryResponse, FileUploadUrlResponse, NewDocResponse,
     },
     auth::{Authenticator, ExpirationTimeEpochMillis, Permission, DEFAULT_EXPIRATION_SECONDS},
-    doc_connection::DocConnection,
+    doc_connection::{DocConnection, SendOutcome},
     doc_sync::DocWithSyncKv,
     event::{
         DebouncedSyncProtocolEventSender, DocumentUpdatedEvent, EventDispatcher, EventEnvelope,
@@ -1191,7 +1191,7 @@ async fn handle_socket_inner<S, T, E>(
     let mut last_pong = tokio::time::Instant::now();
     let mut pong_timed_out = false;
 
-    let close_reason = loop {
+    let close_reason = 'socket: loop {
         tokio::select! {
             msg = stream.next() => {
                 let Some(msg) = msg else {
@@ -1235,7 +1235,79 @@ async fn handle_socket_inner<S, T, E>(
                 };
 
                 match connection.send(&msg).await {
-                    Ok(_) => {},
+                    Ok(SendOutcome::Processed) => {},
+                    Ok(SendOutcome::InitialSyncNeedsDurability) => {
+                        // Some y-websocket-compatible providers reconnect
+                        // automatically when a socket closes. Closing here
+                        // would let the next connection observe the
+                        // integrated-but-not-durable resident document as
+                        // nonempty and could acknowledge it before the failed
+                        // write was retried. Keep the connection unsynced and
+                        // retry with backoff instead. The gate installed by
+                        // DocConnection::set_sync_kv also carries this
+                        // obligation across client-initiated reconnects.
+                        let mut retry_delay = Duration::from_millis(100);
+                        loop {
+                            let result = tokio::select! {
+                                biased;
+                                _ = cancellation_token.cancelled() => {
+                                    let _ = send.try_send(Message::Close(Some(CloseFrame {
+                                        code: 1001,
+                                        reason: "server shutting down".into(),
+                                    })));
+                                    break 'socket "server_shutdown";
+                                }
+                                _ = conn_token.cancelled() => {
+                                    break 'socket "sink_error";
+                                }
+                                result = guard.durability_barrier() => result,
+                            };
+
+                            match result {
+                                Ok(()) => {
+                                    if let Err(error) = connection.finish_initial_sync() {
+                                        tracing::error!(
+                                            ?error,
+                                            doc_id = %doc_id,
+                                            "Failed to finish durable initial sync"
+                                        );
+                                        break 'socket "initial_sync_protocol_failed";
+                                    }
+                                    break;
+                                }
+                                Err(error) => {
+                                    tracing::error!(
+                                        %error,
+                                        doc_id = %doc_id,
+                                        retry_ms = retry_delay.as_millis(),
+                                        "Failed to persist initial client state; retrying without acknowledgement"
+                                    );
+
+                                    // Keep exercising the sink while the read
+                                    // loop is occupied by the durability wait,
+                                    // so a departed peer cancels conn_token.
+                                    let _ = send.try_send(Message::Ping(vec![]));
+                                    tokio::select! {
+                                        biased;
+                                        _ = cancellation_token.cancelled() => {
+                                            let _ = send.try_send(Message::Close(Some(CloseFrame {
+                                                code: 1001,
+                                                reason: "server shutting down".into(),
+                                            })));
+                                            break 'socket "server_shutdown";
+                                        }
+                                        _ = conn_token.cancelled() => {
+                                            break 'socket "sink_error";
+                                        }
+                                        _ = tokio::time::sleep(retry_delay) => {},
+                                    }
+                                    retry_delay = retry_delay
+                                        .saturating_mul(2)
+                                        .min(Duration::from_secs(5));
+                                }
+                            }
+                        }
+                    },
                     Err(e) if e.to_string().contains("Token expired") => {
                         metrics.record_http_auth_error(
                             "expired",
@@ -3481,10 +3553,14 @@ mod test {
 
     mod socket_teardown {
         use super::*;
+        use crate::test_util::GatedStore;
         use futures::channel::mpsc as futures_mpsc;
         use tokio_stream::wrappers::ReceiverStream;
-        use y_sweet_core::sync::Message as SyncMessage;
-        use yrs::updates::encoder::Encode;
+        use y_sweet_core::sync::{Message as SyncMessage, SyncMessage as YSyncMessage};
+        use yrs::{
+            updates::{decoder::Decode, encoder::Encode},
+            GetString, Map, ReadTxn, StateVector, Text, Transact, Update,
+        };
 
         struct SocketHarness {
             to_server: tokio::sync::mpsc::Sender<Result<Message, axum::Error>>,
@@ -3509,12 +3585,20 @@ mod test {
         /// Run handle_socket_inner against in-memory socket halves so
         /// teardown behavior is observable without a WebSocket upgrade.
         async fn spawn_socket(server_token: CancellationToken) -> SocketHarness {
+            spawn_socket_with_store(server_token, None, None).await
+        }
+
+        async fn spawn_socket_with_store(
+            server_token: CancellationToken,
+            store: Option<Arc<Box<dyn Store>>>,
+            user: Option<String>,
+        ) -> SocketHarness {
             let (to_server, stream_rx) =
                 tokio::sync::mpsc::channel::<Result<Message, axum::Error>>(64);
             let (sink_tx, from_server) = futures_mpsc::unbounded::<Message>();
             let metrics = RelayMetrics::new_with_registry(&prometheus::Registry::new()).unwrap();
             let doc = Arc::new(
-                DocWithSyncKv::new("test_doc", None, || (), None)
+                DocWithSyncKv::new("test_doc", store, || (), None)
                     .await
                     .unwrap(),
             );
@@ -3531,7 +3615,7 @@ mod test {
                 guard,
                 Authorization::Full,
                 None,
-                None,
+                user,
                 server_token,
                 Arc::new(SyncProtocolEventSender::new()),
                 "test_doc".to_string(),
@@ -3555,6 +3639,250 @@ mod test {
             client.set_local_state(r#"{"user":"test"}"#);
             let update = client.update().unwrap();
             SyncMessage::Awareness(update).encode_v1()
+        }
+
+        async fn recv_sync_step2(
+            from_server: &mut futures_mpsc::UnboundedReceiver<Message>,
+        ) -> Vec<u8> {
+            loop {
+                let message = from_server
+                    .next()
+                    .await
+                    .expect("server socket closed before SyncStep2");
+                let Message::Binary(bytes) = message else {
+                    continue;
+                };
+                if let SyncMessage::Sync(YSyncMessage::SyncStep2(update)) =
+                    SyncMessage::decode_v1(&bytes).expect("invalid server sync message")
+                {
+                    return update;
+                }
+            }
+        }
+
+        fn nonempty_client_sync() -> (yrs::Doc, Vec<u8>, Vec<u8>) {
+            let client = yrs::Doc::new();
+            let contents = client.get_or_insert_text("contents");
+            contents.insert(&mut client.transact_mut(), 0, "local note must survive");
+
+            let txn = client.transact();
+            let step1 = SyncMessage::Sync(YSyncMessage::SyncStep1(txn.state_vector())).encode_v1();
+            let step2 = SyncMessage::Sync(YSyncMessage::SyncStep2(
+                txn.encode_state_as_update_v1(&StateVector::default()),
+            ))
+            .encode_v1();
+            drop(txn);
+            (client, step1, step2)
+        }
+
+        fn deleted_to_empty_client_sync() -> (Vec<u8>, Vec<u8>) {
+            let client = yrs::Doc::new();
+            let contents = client.get_or_insert_text("contents");
+            {
+                let mut txn = client.transact_mut();
+                contents.insert(&mut txn, 0, "draft");
+                contents.remove_range(&mut txn, 0, 5);
+            }
+
+            let txn = client.transact();
+            assert!(
+                !txn.state_vector().is_empty(),
+                "a deletion-to-empty document must retain CRDT history"
+            );
+            let step1 = SyncMessage::Sync(YSyncMessage::SyncStep1(txn.state_vector())).encode_v1();
+            let step2 = SyncMessage::Sync(YSyncMessage::SyncStep2(
+                txn.encode_state_as_update_v1(&StateVector::default()),
+            ))
+            .encode_v1();
+            (step1, step2)
+        }
+
+        fn contents(doc: &DocWithSyncKv) -> Option<String> {
+            let awareness = doc.awareness();
+            let awareness = awareness.read().unwrap();
+            let txn = awareness.doc().transact();
+            txn.get_text("contents")
+                .map(|contents| contents.get_string(&txn))
+        }
+
+        #[tokio::test]
+        async fn empty_server_defers_sync_step2_until_client_state_is_durable() {
+            let store = GatedStore::new();
+            let boxed_store: Arc<Box<dyn Store>> = Arc::new(Box::new(store.clone()));
+            let mut harness = spawn_socket_with_store(
+                CancellationToken::new(),
+                Some(boxed_store),
+                Some("alice".to_string()),
+            )
+            .await;
+            let (client, client_step1, client_step2) = nonempty_client_sync();
+            let key = "test_doc/data.ysweet";
+
+            // The client response to the server-initiated SyncStep1 is
+            // deliberately held. Its own SyncStep1 crosses in the other
+            // direction first, reproducing a valid crossed handshake.
+            harness
+                .to_server
+                .send(Ok(Message::Binary(client_step1)))
+                .await
+                .unwrap();
+
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(25),
+                    recv_sync_step2(&mut harness.from_server),
+                )
+                .await
+                .is_err(),
+                "an empty server doc granted provider sync before receiving the client's state"
+            );
+
+            // Freeze the backing write, then deliver the reciprocal client
+            // state. It must be integrated in memory but still must not grant
+            // provider sync while the persistence barrier is blocked.
+            store.close_gate();
+            harness
+                .to_server
+                .send(Ok(Message::Binary(client_step2)))
+                .await
+                .unwrap();
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while contents(&harness.doc).as_deref() != Some("local note must survive") {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the client's first state was not integrated");
+
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(25),
+                    recv_sync_step2(&mut harness.from_server),
+                )
+                .await
+                .is_err(),
+                "provider sync was granted before the integrated state was durable"
+            );
+            assert_eq!(store.put_count(key), 0, "the store write should be gated");
+
+            store.release(1);
+            let server_step2 = tokio::time::timeout(
+                Duration::from_secs(5),
+                recv_sync_step2(&mut harness.from_server),
+            )
+            .await
+            .expect("server did not finish initial sync after the durable write");
+
+            client
+                .transact_mut()
+                .apply_update(Update::decode_v1(&server_step2).unwrap())
+                .unwrap();
+            let txn = client.transact();
+            assert_eq!(
+                txn.get_text("contents").unwrap().get_string(&txn),
+                "local note must survive"
+            );
+            assert_eq!(
+                txn.get_map("users").unwrap().len(&txn),
+                1,
+                "the receiving client must observe server-generated user data"
+            );
+
+            assert_eq!(store.put_count(key), 1);
+            assert!(!harness.sync_kv.is_dirty());
+
+            let reloaded = DocWithSyncKv::new(
+                "test_doc",
+                Some(Arc::new(Box::new(store.clone()))),
+                || (),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                contents(&reloaded).as_deref(),
+                Some("local note must survive"),
+                "SyncStep2 must not be sent until the client state survives a reload"
+            );
+
+            drop(harness.to_server);
+            harness.task.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn deletion_to_empty_is_durable_before_initial_sync_completes() {
+            let store = GatedStore::new();
+            let boxed_store: Arc<Box<dyn Store>> = Arc::new(Box::new(store.clone()));
+            let mut harness =
+                spawn_socket_with_store(CancellationToken::new(), Some(boxed_store), None).await;
+            let (client_step1, client_step2) = deleted_to_empty_client_sync();
+
+            harness
+                .to_server
+                .send(Ok(Message::Binary(client_step1)))
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(25),
+                    recv_sync_step2(&mut harness.from_server),
+                )
+                .await
+                .is_err(),
+                "the empty server responded before receiving the deletion history"
+            );
+
+            store.close_gate();
+            harness
+                .to_server
+                .send(Ok(Message::Binary(client_step2)))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while contents(&harness.doc).as_deref() != Some("") {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the deletion-to-empty state was not integrated");
+
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(25),
+                    recv_sync_step2(&mut harness.from_server),
+                )
+                .await
+                .is_err(),
+                "provider sync was granted before the deletion history was durable"
+            );
+
+            store.release(1);
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                recv_sync_step2(&mut harness.from_server),
+            )
+            .await
+            .expect("server did not finish initial sync after persisting the deletion");
+
+            let reloaded = DocWithSyncKv::new(
+                "test_doc",
+                Some(Arc::new(Box::new(store.clone()))),
+                || (),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(contents(&reloaded).as_deref(), Some(""));
+            let awareness = reloaded.awareness();
+            let awareness = awareness.read().unwrap();
+            assert!(
+                !awareness.doc().transact().state_vector().is_empty(),
+                "an intentional empty value must reload with its deletion history"
+            );
+
+            drop(harness.to_server);
+            harness.task.await.unwrap();
         }
 
         fn closes(metrics: &RelayMetrics, reason: &str) -> f64 {
@@ -3766,6 +4094,441 @@ mod test {
             assert!(!harness.task.is_finished());
 
             harness.task.abort();
+        }
+    }
+
+    mod websocket_compatibility {
+        use super::*;
+        use crate::test_util::{test_server, GatedStore};
+        use futures::{SinkExt, StreamExt};
+        use tokio::sync::oneshot;
+        use tokio_tungstenite::{connect_async, tungstenite::Message as WebSocketMessage};
+        use y_sweet_core::sync::{Message as ProtocolMessage, SyncMessage};
+        use yrs::{
+            updates::{decoder::Decode, encoder::Encode},
+            Doc, GetString, ReadTxn, Text, Transact, Update,
+        };
+
+        struct NetworkHarness {
+            server: Arc<Server>,
+            store: GatedStore,
+            doc_id: String,
+            websocket_url: String,
+            shutdown: CancellationToken,
+            task: tokio::task::JoinHandle<()>,
+        }
+
+        impl NetworkHarness {
+            async fn spawn(doc_id: &str) -> Self {
+                let store = GatedStore::new();
+                let shutdown = CancellationToken::new();
+                let server = Arc::new(
+                    test_server(
+                        Some(Box::new(store.clone())),
+                        Duration::from_secs(600),
+                        false,
+                        shutdown.clone(),
+                    )
+                    .await,
+                );
+
+                // Load the empty document before the socket opens so the test
+                // controls precisely when the first client state arrives.
+                server.get_or_create_doc(doc_id).await.unwrap();
+
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let app = server.routes_with_metrics();
+                let server_shutdown = shutdown.clone();
+                let task = tokio::spawn(async move {
+                    axum::serve(listener, app.into_make_service())
+                        .with_graceful_shutdown(server_shutdown.cancelled_owned())
+                        .await
+                        .unwrap();
+                });
+
+                Self {
+                    server,
+                    store,
+                    doc_id: doc_id.to_string(),
+                    websocket_url: format!("ws://{address}/d/{doc_id}/ws/{doc_id}"),
+                    shutdown,
+                    task,
+                }
+            }
+
+            fn resident_doc(&self) -> Arc<DocWithSyncKv> {
+                self.server.registry.peek(&self.doc_id).unwrap()
+            }
+
+            async fn reload(&self) -> DocWithSyncKv {
+                DocWithSyncKv::new(
+                    &self.doc_id,
+                    Some(Arc::new(Box::new(self.store.clone()))),
+                    || (),
+                    None,
+                )
+                .await
+                .unwrap()
+            }
+
+            async fn stop(self) {
+                self.shutdown.cancel();
+                tokio::time::timeout(Duration::from_secs(5), self.task)
+                    .await
+                    .expect("network test server did not stop")
+                    .unwrap();
+            }
+        }
+
+        /// Compatibility client for the original y-websocket handshake:
+        /// send SyncStep1 immediately on open, answer the server's independent
+        /// SyncStep1 with SyncStep2, and report synced as soon as the server's
+        /// SyncStep2 is received.
+        async fn run_legacy_client(
+            websocket_url: String,
+            doc: Doc,
+            synced: oneshot::Sender<()>,
+        ) -> anyhow::Result<Doc> {
+            let (mut socket, response) = connect_async(&websocket_url).await?;
+            anyhow::ensure!(
+                response.status() == StatusCode::SWITCHING_PROTOCOLS,
+                "WebSocket upgrade failed: {}",
+                response.status()
+            );
+
+            let state_vector = doc.transact().state_vector();
+            socket
+                .send(WebSocketMessage::Binary(
+                    ProtocolMessage::Sync(SyncMessage::SyncStep1(state_vector))
+                        .encode_v1()
+                        .into(),
+                ))
+                .await?;
+
+            let mut synced = Some(synced);
+            while let Some(frame) = socket.next().await {
+                match frame? {
+                    WebSocketMessage::Binary(bytes) => {
+                        let message = ProtocolMessage::decode_v1(bytes.as_ref())?;
+                        match message {
+                            ProtocolMessage::Sync(SyncMessage::SyncStep1(server_state_vector)) => {
+                                let update = doc
+                                    .transact()
+                                    .encode_state_as_update_v1(&server_state_vector);
+                                socket
+                                    .send(WebSocketMessage::Binary(
+                                        ProtocolMessage::Sync(SyncMessage::SyncStep2(update))
+                                            .encode_v1()
+                                            .into(),
+                                    ))
+                                    .await?;
+                            }
+                            ProtocolMessage::Sync(SyncMessage::SyncStep2(update)) => {
+                                apply_client_update(&doc, update)?;
+                                if let Some(synced) = synced.take() {
+                                    let _ = synced.send(());
+                                }
+                                let _ = socket.send(WebSocketMessage::Close(None)).await;
+                                return Ok(doc);
+                            }
+                            ProtocolMessage::Sync(SyncMessage::Update(update)) => {
+                                apply_client_update(&doc, update)?;
+                            }
+                            ProtocolMessage::Awareness(_)
+                            | ProtocolMessage::AwarenessQuery
+                            | ProtocolMessage::Auth(_)
+                            | ProtocolMessage::Custom(_, _)
+                            | ProtocolMessage::EventSubscribe(_)
+                            | ProtocolMessage::EventUnsubscribe(_)
+                            | ProtocolMessage::Event(_)
+                            | ProtocolMessage::QuerySubdocs(_)
+                            | ProtocolMessage::Subdocs(_) => {}
+                        }
+                    }
+                    WebSocketMessage::Ping(payload) => {
+                        socket.send(WebSocketMessage::Pong(payload)).await?;
+                    }
+                    WebSocketMessage::Close(frame) => {
+                        anyhow::bail!("server closed before initial sync completed: {frame:?}");
+                    }
+                    WebSocketMessage::Text(_)
+                    | WebSocketMessage::Pong(_)
+                    | WebSocketMessage::Frame(_) => {}
+                }
+            }
+
+            anyhow::bail!("WebSocket ended before initial sync completed")
+        }
+
+        fn apply_client_update(doc: &Doc, update: Vec<u8>) -> anyhow::Result<()> {
+            if update.is_empty() {
+                return Ok(());
+            }
+            doc.transact_mut()
+                .apply_update(Update::decode_v1(&update)?)?;
+            Ok(())
+        }
+
+        fn document_with_contents(contents: &str) -> Doc {
+            let doc = Doc::new();
+            if !contents.is_empty() {
+                doc.get_or_insert_text("contents")
+                    .insert(&mut doc.transact_mut(), 0, contents);
+            }
+            doc
+        }
+
+        fn document_deleted_to_empty() -> Doc {
+            let doc = Doc::new();
+            let contents = doc.get_or_insert_text("contents");
+            let mut txn = doc.transact_mut();
+            contents.insert(&mut txn, 0, "draft");
+            contents.remove_range(&mut txn, 0, 5);
+            drop(txn);
+            doc
+        }
+
+        fn contents(doc: &DocWithSyncKv) -> Option<String> {
+            let awareness = doc.awareness();
+            let awareness = awareness.read().unwrap();
+            let txn = awareness.doc().transact();
+            txn.get_text("contents")
+                .map(|contents| contents.get_string(&txn))
+        }
+
+        async fn assert_initial_sync_waits_for_durability(
+            doc_id: &str,
+            client_doc: Doc,
+            expected_contents: &str,
+        ) {
+            let harness = NetworkHarness::spawn(doc_id).await;
+            let resident = harness.resident_doc();
+            harness.store.close_gate();
+
+            let (synced_tx, mut synced_rx) = oneshot::channel();
+            let client_task = tokio::spawn(run_legacy_client(
+                harness.websocket_url.clone(),
+                client_doc,
+                synced_tx,
+            ));
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while contents(&resident).as_deref() != Some(expected_contents) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the WebSocket client state was not integrated");
+
+            match tokio::time::timeout(Duration::from_millis(100), &mut synced_rx).await {
+                Err(_) => {}
+                Ok(Ok(())) => panic!("client reported synced before its state was durable"),
+                Ok(Err(_)) => panic!("client disconnected before its state was durable"),
+            }
+            assert_eq!(
+                harness.store.put_count(&format!("{doc_id}/data.ysweet")),
+                0,
+                "the persistence write should still be held by the gate"
+            );
+
+            harness.store.release(1);
+            tokio::time::timeout(Duration::from_secs(5), &mut synced_rx)
+                .await
+                .expect("client was not marked synced after persistence completed")
+                .expect("client disconnected before receiving server SyncStep2");
+
+            let client_doc = client_task.await.unwrap().unwrap();
+            assert_eq!(
+                client_doc
+                    .get_or_insert_text("contents")
+                    .get_string(&client_doc.transact()),
+                expected_contents
+            );
+            assert!(!resident.sync_kv().is_dirty());
+
+            let reloaded = harness.reload().await;
+            assert_eq!(contents(&reloaded).as_deref(), Some(expected_contents));
+            assert!(
+                !reloaded
+                    .awareness()
+                    .read()
+                    .unwrap()
+                    .doc()
+                    .transact()
+                    .state_vector()
+                    .is_empty(),
+                "the persisted document must retain CRDT state"
+            );
+
+            harness.stop().await;
+        }
+
+        #[tokio::test]
+        async fn websocket_client_does_not_sync_before_nonempty_state_is_durable() {
+            assert_initial_sync_waits_for_durability(
+                "websocket-nonempty",
+                document_with_contents("local note must survive"),
+                "local note must survive",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn websocket_client_does_not_sync_before_empty_deletion_is_durable() {
+            assert_initial_sync_waits_for_durability(
+                "websocket-deleted",
+                document_deleted_to_empty(),
+                "",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn websocket_transient_persist_failure_does_not_close_or_ack() {
+            let harness = NetworkHarness::spawn("websocket-persist-retry").await;
+            let resident = harness.resident_doc();
+            let key = "websocket-persist-retry/data.ysweet";
+            harness.store.fail_next_sets(1);
+            harness.store.close_gate();
+
+            let (synced_tx, mut synced_rx) = oneshot::channel();
+            let client_task = tokio::spawn(run_legacy_client(
+                harness.websocket_url.clone(),
+                document_with_contents("retry without closing the client"),
+                synced_tx,
+            ));
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while contents(&resident).as_deref() != Some("retry without closing the client")
+                    || harness.store.set_attempt_count(key) < 1
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the initial state was not integrated and flushed once");
+
+            match tokio::time::timeout(Duration::from_millis(100), &mut synced_rx).await {
+                Err(_) => {}
+                Ok(Ok(())) => panic!("client synced after a failed persistence attempt"),
+                Ok(Err(_)) => panic!("server closed the client after a transient persist failure"),
+            }
+            assert_eq!(harness.store.put_count(key), 0);
+            assert!(resident.sync_kv().has_unpersisted_changes());
+
+            harness.store.release(1);
+            tokio::time::timeout(Duration::from_secs(5), &mut synced_rx)
+                .await
+                .expect("client was not synced after the persistence retry succeeded")
+                .expect("client disconnected before receiving SyncStep2");
+            client_task.await.unwrap().unwrap();
+
+            assert_eq!(harness.store.set_attempt_count(key), 2);
+            assert_eq!(harness.store.put_count(key), 1);
+            assert!(!resident.sync_kv().has_unpersisted_changes());
+            harness.stop().await;
+        }
+
+        #[tokio::test]
+        async fn websocket_reconnect_cannot_bypass_pending_initial_durability() {
+            let harness = NetworkHarness::spawn("websocket-reconnect").await;
+            let resident = harness.resident_doc();
+            let client_doc = document_with_contents("local note must survive reconnect");
+            let key = "websocket-reconnect/data.ysweet";
+            // Keep persistence failing while the client closes and reconnects.
+            // Unlike a gated write, a failed attempt releases the lifecycle
+            // actor, so the reconnect can attach to the same
+            // integrated-but-dirty resident document.
+            harness.store.fail_next_sets(100);
+
+            // A legacy y-websocket handshake sends its own SyncStep1
+            // immediately, answers the server's independent SyncStep1, and
+            // retains the same Y.Doc when the socket reconnects.
+            let (mut first_socket, response) = connect_async(&harness.websocket_url).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+            first_socket
+                .send(WebSocketMessage::Binary(
+                    ProtocolMessage::Sync(SyncMessage::SyncStep1(
+                        client_doc.transact().state_vector(),
+                    ))
+                    .encode_v1()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            loop {
+                let frame = tokio::time::timeout(Duration::from_secs(5), first_socket.next())
+                    .await
+                    .expect("server did not begin the first WebSocket handshake")
+                    .expect("first WebSocket ended during its handshake")
+                    .unwrap();
+                let WebSocketMessage::Binary(bytes) = frame else {
+                    continue;
+                };
+                if let ProtocolMessage::Sync(SyncMessage::SyncStep1(server_state_vector)) =
+                    ProtocolMessage::decode_v1(bytes.as_ref()).unwrap()
+                {
+                    let update = client_doc
+                        .transact()
+                        .encode_state_as_update_v1(&server_state_vector);
+                    first_socket
+                        .send(WebSocketMessage::Binary(
+                            ProtocolMessage::Sync(SyncMessage::SyncStep2(update))
+                                .encode_v1()
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    break;
+                }
+            }
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while contents(&resident).as_deref() != Some("local note must survive reconnect") {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the first socket's client state was not integrated");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while harness.store.set_attempt_count(key) < 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the first persistence attempt did not fail");
+            assert_eq!(harness.store.put_count(key), 0);
+
+            let _ = first_socket.close(None).await;
+
+            let (synced_tx, mut synced_rx) = oneshot::channel();
+            let reconnected_client = tokio::spawn(run_legacy_client(
+                harness.websocket_url.clone(),
+                client_doc,
+                synced_tx,
+            ));
+
+            match tokio::time::timeout(Duration::from_millis(300), &mut synced_rx).await {
+                Err(_) => {}
+                Ok(Ok(())) => {
+                    panic!("reconnected client synced from resident state before it was durable")
+                }
+                Ok(Err(_)) => panic!("reconnected client disconnected before durability completed"),
+            }
+
+            harness.store.fail_next_sets(0);
+            tokio::time::timeout(Duration::from_secs(5), &mut synced_rx)
+                .await
+                .expect("reconnected client was not synced after persistence completed")
+                .expect("reconnected client disconnected before receiving SyncStep2");
+            reconnected_client.await.unwrap().unwrap();
+
+            assert!(harness.store.set_attempt_count(key) >= 2);
+            assert_eq!(harness.store.put_count(key), 1);
+            assert!(!resident.sync_kv().has_unpersisted_changes());
+            harness.stop().await;
         }
     }
 }

@@ -7,7 +7,7 @@ use std::{
     convert::Infallible,
     ops::Bound,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, RwLock,
     },
 };
@@ -116,11 +116,33 @@ pub enum PersistOutcome {
     Clobbered,
 }
 
+/// Restores the dirty bit if a claimed snapshot leaves without completing,
+/// and keeps the in-flight counter exact across every early return.
+struct PersistGuard<'a> {
+    dirty: &'a AtomicBool,
+    persists_inflight: &'a AtomicUsize,
+    claimed_dirty: bool,
+    completed: bool,
+}
+
+impl Drop for PersistGuard<'_> {
+    fn drop(&mut self) {
+        if self.claimed_dirty && !self.completed {
+            self.dirty.store(true, Ordering::SeqCst);
+        }
+        self.persists_inflight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 pub struct SyncKv {
     data: Arc<Mutex<BTreeMap<Vec<u8>, Vec<u8>>>>,
     store: Option<Arc<Box<dyn Store>>>,
     key: String,
     dirty: AtomicBool,
+    /// Number of snapshots that have claimed the dirty bit but have not yet
+    /// completed their store write. `dirty == false` during that await, so
+    /// durability-sensitive callers must consider both values.
+    persists_inflight: AtomicUsize,
     /// Fired on every clean→dirty transition. Rewireable so the lifecycle
     /// layer can point it at a doc's actor after construction.
     dirty_callback: RwLock<Box<dyn Fn() + Send + Sync>>,
@@ -187,6 +209,7 @@ impl SyncKv {
             store,
             key,
             dirty: AtomicBool::new(false),
+            persists_inflight: AtomicUsize::new(0),
             dirty_callback: RwLock::new(Box::new(callback)),
             created_at,
             write_lease: Arc::new(Mutex::new(write_lease)),
@@ -228,6 +251,7 @@ impl SyncKv {
             store: None,
             key: key_str,
             dirty: AtomicBool::new(false),
+            persists_inflight: AtomicUsize::new(0),
             dirty_callback: RwLock::new(Box::new(|| ())),
             created_at,
             write_lease: Arc::new(Mutex::new(None)),
@@ -238,8 +262,9 @@ impl SyncKv {
 
     fn mark_dirty(&self) {
         // The callback fires only on the clean→dirty edge and is a
-        // wake-up hint; the dirty bit itself is the durability truth that
-        // every flush decision re-reads.
+        // wake-up hint. Flush scheduling re-reads the bit; callers deciding
+        // whether state is durable use `has_unpersisted_changes`, which also
+        // includes a snapshot currently in flight.
         if !self.dirty.load(Ordering::Relaxed) {
             self.dirty.store(true, Ordering::Relaxed);
             (self.dirty_callback.read().unwrap())();
@@ -304,9 +329,18 @@ impl SyncKv {
     }
 
     async fn persist_inner(&self, require_lease: bool) -> Result<(), Box<dyn std::error::Error>> {
-        if !self.dirty.swap(false, Ordering::Relaxed) {
+        self.persists_inflight.fetch_add(1, Ordering::SeqCst);
+        let mut persist_guard = PersistGuard {
+            dirty: &self.dirty,
+            persists_inflight: &self.persists_inflight,
+            claimed_dirty: false,
+            completed: false,
+        };
+        if !self.dirty.swap(false, Ordering::SeqCst) {
+            persist_guard.completed = true;
             return Ok(());
         }
+        persist_guard.claimed_dirty = true;
 
         if let Some(store) = &self.store {
             let now = current_timestamp_ms();
@@ -351,12 +385,11 @@ impl SyncKv {
                     *self.write_lease.lock().unwrap() = Some(new_lease);
                 }
                 Err(e) => {
-                    // Re-mark as dirty so the next cycle retries.
-                    self.dirty.store(true, Ordering::Relaxed);
                     return Err(e.into());
                 }
             }
         }
+        persist_guard.completed = true;
         Ok(())
     }
 
@@ -384,6 +417,18 @@ impl SyncKv {
     /// Whether local state has changes the store has not seen.
     pub fn is_dirty(&self) -> bool {
         self.dirty.load(Ordering::Relaxed)
+    }
+
+    /// Whether memory contains state that is not yet known to be durable.
+    /// This remains true while a snapshot write is in flight, including the
+    /// interval in which [`Self::is_dirty`] is temporarily false.
+    pub fn has_unpersisted_changes(&self) -> bool {
+        self.dirty.load(Ordering::SeqCst)
+            || self.persists_inflight.load(Ordering::SeqCst) > 0
+            // A failed persist restores dirty immediately before decrementing
+            // the in-flight count. Re-read it so a caller spanning that
+            // handoff cannot observe both values as false.
+            || self.dirty.load(Ordering::SeqCst)
     }
 
     /// Set metadata for this document

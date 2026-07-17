@@ -24,7 +24,9 @@ pub(crate) struct GatedStore {
     inner: MemoryStore,
     gated: Arc<AtomicBool>,
     gate: Arc<Semaphore>,
+    fail_sets: Arc<AtomicUsize>,
     gets: Arc<DashMap<String, usize>>,
+    set_attempts: Arc<DashMap<String, usize>>,
     puts: Arc<DashMap<String, usize>>,
 }
 
@@ -34,9 +36,16 @@ impl GatedStore {
             inner: MemoryStore::new(),
             gated: Arc::new(AtomicBool::new(false)),
             gate: Arc::new(Semaphore::new(0)),
+            fail_sets: Arc::new(AtomicUsize::new(0)),
             gets: Arc::new(DashMap::new()),
+            set_attempts: Arc::new(DashMap::new()),
             puts: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Fail the next `n` calls to `set` before they reach the gate.
+    pub fn fail_next_sets(&self, n: usize) {
+        self.fail_sets.store(n, Ordering::SeqCst);
     }
 
     /// Hold every subsequent `set` until `release` or `open`.
@@ -64,6 +73,10 @@ impl GatedStore {
         self.puts.get(key).map(|v| *v).unwrap_or(0)
     }
 
+    pub fn set_attempt_count(&self, key: &str) -> usize {
+        self.set_attempts.get(key).map(|v| *v).unwrap_or(0)
+    }
+
     /// Bytes currently stored for `key` (bypasses the gate).
     pub fn stored(&self, key: &str) -> Option<Vec<u8>> {
         self.inner.get_bytes(key)
@@ -82,6 +95,16 @@ impl Store for GatedStore {
     }
 
     async fn set(&self, key: &str, value: Vec<u8>) -> StoreResult<()> {
+        *self.set_attempts.entry(key.to_owned()).or_insert(0) += 1;
+        if self
+            .fail_sets
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(y_sweet_core::store::StoreError::ConnectionError(format!(
+                "injected failure writing {key}"
+            )));
+        }
         if self.gated.load(Ordering::SeqCst) {
             // Waiters queue here until the test releases the gate. The
             // permit is intentionally consumed: one release() == one PUT.

@@ -120,8 +120,8 @@ pub enum DocMsg {
     Detach {
         kind: AttachKind,
     },
-    /// Wake-up hint from the doc's clean→dirty edge; the dirty bit is the
-    /// truth and every flush decision re-reads it.
+    /// Wake-up hint from the doc's clean→dirty edge. Flush scheduling
+    /// re-reads the bit; an in-flight persist is tracked separately.
     Dirty,
     /// A subdoc pushing its snapshot into this (parent) doc's metadata
     /// index — cross-doc mutation goes through the owner's mailbox.
@@ -136,6 +136,11 @@ pub enum DocMsg {
     /// was anything to flush. The doc stays resident.
     Drain {
         reply: oneshot::Sender<bool>,
+    },
+    /// Persist every change observed before this mailbox message. Used by
+    /// protocols whose acknowledgement is also a durability promise.
+    DurabilityBarrier {
+        reply: oneshot::Sender<Result<(), String>>,
     },
 }
 
@@ -218,6 +223,19 @@ impl AttachGuard {
 
     pub fn doc(&self) -> &Arc<DocWithSyncKv> {
         &self.doc
+    }
+
+    /// Make all document changes preceding this call durable. The lifecycle
+    /// actor serializes this with its normal checkpoint worker, so a caller
+    /// never races a second persist against an in-flight one.
+    pub async fn durability_barrier(&self) -> Result<(), String> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(DocMsg::DurabilityBarrier { reply: reply_tx })
+            .map_err(|_| "document lifecycle actor is gone".to_string())?;
+        reply_rx
+            .await
+            .map_err(|_| "document lifecycle actor stopped during flush".to_string())?
     }
 
     /// Route a subdoc's snapshot to this doc's actor (the guard here is a
@@ -538,8 +556,55 @@ impl DocActor {
                 let _ = reply.send(was_dirty);
                 false
             }
+            DocMsg::DurabilityBarrier { reply } => {
+                let result = self.flush_for_durability().await;
+                if result.is_err() && self.doc.sync_kv().is_dirty() {
+                    self.schedule_persist();
+                }
+                let _ = reply.send(result);
+                false
+            }
             DocMsg::Evict { reply } => self.handle_evict(reply).await,
         }
+    }
+
+    /// Await any checkpoint already in flight, then persist until the dirty
+    /// bit is clear. Unlike process drain, a failed attempt is reported to the
+    /// live caller so it can withhold its protocol acknowledgement.
+    async fn flush_for_durability(&mut self) -> Result<(), String> {
+        self.persist_timer = None;
+
+        if let Some(inflight) = self.persist_inflight.take() {
+            let result = inflight.await.unwrap_or(PersistTaskResult::Failed);
+            match result {
+                PersistTaskResult::Persisted => {
+                    self.last_persist_ok = tokio::time::Instant::now();
+                    self.persist_backoff = 0;
+                }
+                PersistTaskResult::Clobbered => {
+                    self.metrics.record_doc_persist_conflict();
+                }
+                PersistTaskResult::Failed => {
+                    self.persist_backoff = (self.persist_backoff + 1).min(8);
+                    return Err("checkpoint persist failed".to_string());
+                }
+            }
+        }
+
+        while self.doc.sync_kv().is_dirty() {
+            match self.flush_once().await {
+                FlushStep::Progress => {}
+                FlushStep::Error => {
+                    self.persist_backoff = (self.persist_backoff + 1).min(8);
+                    return Err("durability flush failed".to_string());
+                }
+            }
+        }
+
+        self.persist_queued = false;
+        self.last_persist_ok = tokio::time::Instant::now();
+        self.persist_backoff = 0;
+        Ok(())
     }
 
     /// One inline flush attempt for the evict/drain loops: persist with
