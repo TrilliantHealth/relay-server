@@ -104,7 +104,7 @@ impl DocWithSyncKv {
         let mut txn = doc.transact_mut();
         txn.apply_update(update)
             .map_err(|err| anyhow!("Failed to apply update: {}", err))?;
-        crate::sync::block_filemeta_path_traversal(&mut txn);
+        crate::sync::block_file_metadata_path_traversal(&mut txn);
 
         Ok(())
     }
@@ -411,13 +411,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_update_blocks_filemeta_path_traversal() {
+    async fn direct_update_blocks_path_traversal_in_current_and_legacy_metadata() {
         let source = Doc::with_client_id(1);
-        let filemeta = source.get_or_insert_map("filemeta_v0");
-        {
+        for root in ["filemeta_v0", "docs"] {
+            let metadata = source.get_or_insert_map(root);
             let mut txn = source.transact_mut();
-            filemeta.insert(&mut txn, "folder/note.md", "safe");
-            filemeta.insert(&mut txn, "folder/../secret.md", "blocked");
+            metadata.insert(&mut txn, "/note.md", "safe");
+            metadata.insert(&mut txn, "/../hello2.md", "blocked");
+            metadata.insert(&mut txn, "/../../hello2.md", "blocked");
         }
         let update = source
             .transact()
@@ -431,9 +432,12 @@ mod tests {
         let awareness = target.awareness();
         let guard = awareness.read().unwrap();
         let txn = guard.doc().transact();
-        let filemeta = txn.get_map("filemeta_v0").unwrap();
-        assert!(filemeta.get(&txn, "folder/note.md").is_some());
-        assert!(filemeta.get(&txn, "folder/../secret.md").is_none());
+        for root in ["filemeta_v0", "docs"] {
+            let metadata = txn.get_map(root).unwrap();
+            assert!(metadata.get(&txn, "/note.md").is_some());
+            assert!(metadata.get(&txn, "/../hello2.md").is_none());
+            assert!(metadata.get(&txn, "/../../hello2.md").is_none());
+        }
     }
 
     #[tokio::test]

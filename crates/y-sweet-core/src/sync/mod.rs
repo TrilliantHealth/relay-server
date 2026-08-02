@@ -9,7 +9,7 @@ use yrs::updates::decoder::{Decode, Decoder};
 use yrs::updates::encoder::{Encode, Encoder};
 use yrs::{Map, ReadTxn, StateVector, Transact, Update};
 
-const FILEMETA_ROOT: &str = "filemeta_v0";
+const FILE_METADATA_ROOTS: [&str; 2] = ["filemeta_v0", "docs"];
 
 fn has_parent_directory_component(path: &str) -> bool {
     path.split('/').any(|component| component == "..")
@@ -19,29 +19,31 @@ fn has_parent_directory_component(path: &str) -> bool {
 /// shared-folder root. Run this before the incoming transaction commits so
 /// persistence and broadcast observers only see the offending entries as
 /// tombstoned.
-pub(crate) fn block_filemeta_path_traversal(txn: &mut yrs::TransactionMut) {
-    let Some(filemeta) = txn.get_map(FILEMETA_ROOT) else {
-        return;
-    };
+pub(crate) fn block_file_metadata_path_traversal(txn: &mut yrs::TransactionMut) {
+    for root in FILE_METADATA_ROOTS {
+        let Some(metadata) = txn.get_map(root) else {
+            continue;
+        };
 
-    let blocked_keys: Vec<_> = filemeta
-        .keys(txn)
-        .filter(|key| has_parent_directory_component(key))
-        .map(str::to_owned)
-        .collect();
+        let blocked_keys: Vec<_> = metadata
+            .keys(txn)
+            .filter(|key| has_parent_directory_component(key))
+            .map(str::to_owned)
+            .collect();
 
-    if blocked_keys.is_empty() {
-        return;
-    }
+        if blocked_keys.is_empty() {
+            continue;
+        }
 
-    tracing::warn!(
-        crdt_root = FILEMETA_ROOT,
-        blocked_writes = blocked_keys.len(),
-        "Blocked file metadata writes containing path traversal"
-    );
+        tracing::warn!(
+            crdt_root = root,
+            blocked_writes = blocked_keys.len(),
+            "Blocked file metadata writes containing path traversal"
+        );
 
-    for key in blocked_keys {
-        filemeta.remove(txn, &key);
+        for key in blocked_keys {
+            metadata.remove(txn, &key);
+        }
     }
 }
 
@@ -147,7 +149,7 @@ pub trait Protocol {
     ) -> Result<Option<Message>, Error> {
         let mut txn = awareness.doc().transact_mut();
         txn.apply_update(update)?;
-        block_filemeta_path_traversal(&mut txn);
+        block_file_metadata_path_traversal(&mut txn);
         Ok(None)
     }
 
@@ -541,38 +543,40 @@ mod test {
     }
 
     #[test]
-    fn filemeta_path_traversal_writes_are_blocked() {
+    fn file_metadata_path_traversal_writes_are_blocked_in_current_and_legacy_maps() {
         let source = Doc::with_client_id(1);
-        let filemeta = source.get_or_insert_map(super::FILEMETA_ROOT);
-        {
+        for root in super::FILE_METADATA_ROOTS {
+            let metadata = source.get_or_insert_map(root);
             let mut txn = source.transact_mut();
-            filemeta.insert(&mut txn, "folder/note.md", "safe");
-            filemeta.insert(&mut txn, "folder/../secret.md", "blocked");
-            filemeta.insert(&mut txn, "../secret.md", "blocked");
-            filemeta.insert(&mut txn, "folder/..", "blocked");
-            filemeta.insert(&mut txn, "..", "blocked");
-            filemeta.insert(&mut txn, "folder/.../note.md", "safe");
-            filemeta.insert(&mut txn, "folder/..note.md", "safe");
+            metadata.insert(&mut txn, "/note.md", "safe");
+            metadata.insert(&mut txn, "/../hello2.md", "blocked");
+            metadata.insert(&mut txn, "/../../hello2.md", "blocked");
+            metadata.insert(&mut txn, "folder/..", "blocked");
+            metadata.insert(&mut txn, "..", "blocked");
+            metadata.insert(&mut txn, "folder/.../note.md", "safe");
+            metadata.insert(&mut txn, "folder/..note.md", "safe");
         }
 
         let mut awareness = Awareness::default();
         apply_update(&mut awareness, &full_update(&source));
 
         let txn = awareness.doc().transact();
-        let filemeta = txn.get_map(super::FILEMETA_ROOT).unwrap();
-        assert!(filemeta.get(&txn, "folder/note.md").is_some());
-        assert!(filemeta.get(&txn, "folder/.../note.md").is_some());
-        assert!(filemeta.get(&txn, "folder/..note.md").is_some());
-        assert!(filemeta.get(&txn, "folder/../secret.md").is_none());
-        assert!(filemeta.get(&txn, "../secret.md").is_none());
-        assert!(filemeta.get(&txn, "folder/..").is_none());
-        assert!(filemeta.get(&txn, "..").is_none());
+        for root in super::FILE_METADATA_ROOTS {
+            let metadata = txn.get_map(root).unwrap();
+            assert!(metadata.get(&txn, "/note.md").is_some());
+            assert!(metadata.get(&txn, "folder/.../note.md").is_some());
+            assert!(metadata.get(&txn, "folder/..note.md").is_some());
+            assert!(metadata.get(&txn, "/../hello2.md").is_none());
+            assert!(metadata.get(&txn, "/../../hello2.md").is_none());
+            assert!(metadata.get(&txn, "folder/..").is_none());
+            assert!(metadata.get(&txn, "..").is_none());
+        }
     }
 
     #[test]
     fn pending_filemeta_path_traversal_write_is_blocked_when_integrated() {
         let source = Doc::with_client_id(1);
-        let filemeta = source.get_or_insert_map(super::FILEMETA_ROOT);
+        let filemeta = source.get_or_insert_map("filemeta_v0");
         let updates = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let updates_for_observer = updates.clone();
         let _subscription = source
@@ -595,7 +599,7 @@ mod test {
         apply_update(&mut awareness, &updates[0]);
 
         let txn = awareness.doc().transact();
-        let filemeta = txn.get_map(super::FILEMETA_ROOT).unwrap();
+        let filemeta = txn.get_map("filemeta_v0").unwrap();
         assert!(filemeta.get(&txn, "folder/../secret.md").is_none());
     }
 
