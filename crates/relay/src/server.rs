@@ -31,7 +31,7 @@ use tempfile::NamedTempFile;
 use tokio::{
     net::TcpListener,
     sync::{
-        mpsc::{channel, Receiver},
+        mpsc::{channel, error::TrySendError, Receiver},
         Mutex as AsyncMutex,
     },
 };
@@ -515,14 +515,14 @@ impl Server {
                             tracing::debug!("doc is still alive - it has {} references", awareness.strong_count());
                         } else {
                             checkpoints_without_refs += 1;
-                            tracing::info!("doc has only one reference, candidate for GC. checkpoints_without_refs: {}", checkpoints_without_refs);
+                            tracing::debug!("doc has only one reference, candidate for GC. checkpoints_without_refs: {}", checkpoints_without_refs);
                         }
                     } else {
                         break;
                     }
 
                     if checkpoints_without_refs >= 2 {
-                        tracing::info!("GCing doc");
+                        tracing::debug!("GCing doc");
                         if let Some(doc) = docs.get(&doc_id) {
                             // Compact PUD before shutdown: dedup ids, clear ds.
                             // The mutations create tombstones which yrs GC will
@@ -547,7 +547,7 @@ impl Server {
                 }
             };
         }
-        tracing::info!("Exiting gc_loop");
+        tracing::debug!("Exiting gc_loop");
     }
 
     async fn doc_persistence_worker(
@@ -573,7 +573,7 @@ impl Server {
             if !is_done && now - last_save < checkpoint_freq {
                 let sleep = tokio::time::sleep(checkpoint_freq - (now - last_save));
                 tokio::pin!(sleep);
-                tracing::info!("Throttling.");
+                tracing::debug!("Throttling.");
 
                 loop {
                     tokio::select! {
@@ -581,18 +581,18 @@ impl Server {
                             break;
                         }
                         v = recv.recv() => {
-                            tracing::info!("Received dirty while throttling.");
+                            tracing::debug!("Received dirty while throttling.");
                             if v.is_none() {
                                 break;
                             }
                         }
                         _ = cancellation_token.cancelled() => {
-                            tracing::info!("Received cancellation while throttling.");
+                            tracing::debug!("Received cancellation while throttling.");
                             break;
                         }
 
                     }
-                    tracing::info!("Done throttling.");
+                    tracing::debug!("Done throttling.");
                 }
             }
             tracing::debug!("Persisting.");
@@ -607,7 +607,7 @@ impl Server {
                 break;
             }
         }
-        tracing::info!("Terminating loop for {}", doc_id);
+        tracing::debug!("Terminating loop for {}", doc_id);
     }
 
     pub async fn get_or_create_doc(
@@ -1168,13 +1168,43 @@ async fn handle_socket(
     });
 
     let send_clone = send.clone();
+    let callback_doc_id = doc_id.clone();
+    let callback_user = user.clone();
+    // A wedged client can stay full for hours; per-message warns have produced
+    // millions of identical, contextless lines in one incident. Log the
+    // full/recovered transitions with identity, count drops in between.
+    let channel_full = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let dropped_while_full = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut conn = DocConnection::new_with_expiration(
         awareness,
         authorization,
         expiration_time,
         move |bytes| {
-            if let Err(e) = send_clone.try_send(Message::Binary(bytes.to_vec())) {
-                tracing::warn!(?e, "Error sending message");
+            match send_clone.try_send(Message::Binary(bytes.to_vec())) {
+                Ok(()) => {
+                    if channel_full.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                        tracing::info!(
+                            doc_id = %callback_doc_id,
+                            user = ?callback_user,
+                            dropped = dropped_while_full
+                                .swap(0, std::sync::atomic::Ordering::Relaxed),
+                            "Outbound channel recovered; messages were dropped while full"
+                        );
+                    }
+                }
+                Err(TrySendError::Closed(_)) => {
+                    tracing::debug!("Dropping outbound message: writer task exited");
+                }
+                Err(TrySendError::Full(_)) => {
+                    dropped_while_full.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if !channel_full.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        tracing::warn!(
+                            doc_id = %callback_doc_id,
+                            user = ?callback_user,
+                            "Outbound channel full; dropping messages until it recovers"
+                        );
+                    }
+                }
             }
         },
     );
