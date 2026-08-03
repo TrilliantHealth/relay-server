@@ -111,10 +111,20 @@ impl DocWithSyncKv {
 
     /// Set the channel for this document in metadata
     pub fn set_channel(&self, channel: &str) {
-        self.sync_kv.update_metadata(
-            "channel".to_string(),
-            ciborium::value::Value::Text(channel.to_string()),
-        );
+        self.sync_kv.with_metadata_if_changed(|metadata| {
+            if matches!(
+                metadata.get("channel"),
+                Some(ciborium::value::Value::Text(current)) if current == channel
+            ) {
+                false
+            } else {
+                metadata.insert(
+                    "channel".to_string(),
+                    ciborium::value::Value::Text(channel.to_string()),
+                );
+                true
+            }
+        });
     }
 
     /// Get the channel for this document from metadata
@@ -325,6 +335,7 @@ mod tests {
     #[derive(Default, Clone)]
     struct MemoryStore {
         data: Arc<DashMap<String, Vec<u8>>>,
+        writes: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     #[cfg_attr(not(feature = "single-threaded"), async_trait)]
@@ -337,6 +348,8 @@ mod tests {
             Ok(self.data.get(key).map(|v| v.clone()))
         }
         async fn set(&self, key: &str, value: Vec<u8>) -> crate::store::Result<()> {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.data.insert(key.to_owned(), value);
             Ok(())
         }
@@ -347,6 +360,46 @@ mod tests {
         async fn exists(&self, key: &str) -> crate::store::Result<bool> {
             Ok(self.data.contains_key(key))
         }
+    }
+
+    #[tokio::test]
+    async fn setting_an_unchanged_channel_does_not_persist() {
+        let store = MemoryStore::default();
+        let doc = DocWithSyncKv::new(
+            "channel-idempotency",
+            Some(Arc::new(Box::new(store.clone()))),
+            || (),
+            None,
+        )
+        .await
+        .unwrap();
+
+        doc.set_channel("relay-a");
+        assert!(doc.sync_kv().is_dirty());
+        doc.sync_kv().persist().await.unwrap();
+        assert_eq!(store.writes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop(doc);
+
+        let doc = DocWithSyncKv::new(
+            "channel-idempotency",
+            Some(Arc::new(Box::new(store.clone()))),
+            || (),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(doc.get_channel().as_deref(), Some("relay-a"));
+        assert!(!doc.sync_kv().is_dirty());
+
+        doc.set_channel("relay-a");
+        assert!(!doc.sync_kv().is_dirty());
+        doc.sync_kv().persist().await.unwrap();
+        assert_eq!(store.writes.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        doc.set_channel("relay-b");
+        assert!(doc.sync_kv().is_dirty());
+        doc.sync_kv().persist().await.unwrap();
+        assert_eq!(store.writes.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
