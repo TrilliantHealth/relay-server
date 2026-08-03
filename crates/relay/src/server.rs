@@ -1243,6 +1243,7 @@ async fn handle_socket(
         },
     );
     conn.set_sync_kv(sync_kv);
+    conn.set_doc_id(doc_id.clone());
     if let Some(user) = user {
         conn.set_user(user);
     }
