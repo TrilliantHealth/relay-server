@@ -60,6 +60,11 @@ use y_sweet_core::{
 
 const RELAY_SERVER_VERSION: &str = env!("GIT_VERSION");
 
+/// How often to re-warn while a connection's outbound channel stays full. The
+/// full/recovered transition warns cover the common case; this distinguishes a
+/// client that is wedged for hours from one that stalled briefly.
+const CHANNEL_FULL_REWARN: Duration = Duration::from_secs(300);
+
 #[derive(Clone, Debug)]
 pub struct AllowedHost {
     pub host: String,
@@ -1160,6 +1165,8 @@ async fn handle_socket(
 ) {
     let (mut sink, mut stream) = socket.split();
     let (send, mut recv) = channel(1024);
+    let connected_at = std::time::Instant::now();
+    tracing::debug!(doc_id = %doc_id, user = ?user, "WebSocket connected");
 
     tokio::spawn(async move {
         while let Some(msg) = recv.recv().await {
@@ -1170,40 +1177,67 @@ async fn handle_socket(
     let send_clone = send.clone();
     let callback_doc_id = doc_id.clone();
     let callback_user = user.clone();
+    let log_user = user.clone();
     // A wedged client can stay full for hours; per-message warns have produced
     // millions of identical, contextless lines in one incident. Log the
-    // full/recovered transitions with identity, count drops in between.
+    // full/recovered transitions with identity, count drops in between, and
+    // re-warn periodically so a long wedge stays visible.
     let channel_full = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let dropped_while_full = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let full_since_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let last_warn_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut conn = DocConnection::new_with_expiration(
         awareness,
         authorization,
         expiration_time,
-        move |bytes| {
-            match send_clone.try_send(Message::Binary(bytes.to_vec())) {
-                Ok(()) => {
-                    if channel_full.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                        tracing::info!(
-                            doc_id = %callback_doc_id,
-                            user = ?callback_user,
-                            dropped = dropped_while_full
-                                .swap(0, std::sync::atomic::Ordering::Relaxed),
-                            "Outbound channel recovered; messages were dropped while full"
-                        );
-                    }
+        move |bytes| match send_clone.try_send(Message::Binary(bytes.to_vec())) {
+            Ok(()) => {
+                if channel_full.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!(
+                        doc_id = %callback_doc_id,
+                        user = ?callback_user,
+                        dropped = dropped_while_full
+                            .swap(0, std::sync::atomic::Ordering::Relaxed),
+                        full_secs = (connected_at.elapsed().as_millis() as u64)
+                            .saturating_sub(
+                                full_since_ms.load(std::sync::atomic::Ordering::Relaxed),
+                            )
+                            / 1000,
+                        "Outbound channel recovered; messages were dropped while full"
+                    );
                 }
-                Err(TrySendError::Closed(_)) => {
-                    tracing::debug!("Dropping outbound message: writer task exited");
-                }
-                Err(TrySendError::Full(_)) => {
-                    dropped_while_full.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if !channel_full.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        tracing::warn!(
-                            doc_id = %callback_doc_id,
-                            user = ?callback_user,
-                            "Outbound channel full; dropping messages until it recovers"
-                        );
-                    }
+            }
+            Err(TrySendError::Closed(_)) => {
+                tracing::debug!("Dropping outbound message: writer task exited");
+            }
+            Err(TrySendError::Full(_)) => {
+                let dropped =
+                    dropped_while_full.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let now_ms = connected_at.elapsed().as_millis() as u64;
+                if !channel_full.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    full_since_ms.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+                    last_warn_ms.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(
+                        doc_id = %callback_doc_id,
+                        user = ?callback_user,
+                        "Outbound channel full; dropping messages until it recovers"
+                    );
+                } else if now_ms
+                    .saturating_sub(last_warn_ms.load(std::sync::atomic::Ordering::Relaxed))
+                    >= CHANNEL_FULL_REWARN.as_millis() as u64
+                {
+                    last_warn_ms.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(
+                        doc_id = %callback_doc_id,
+                        user = ?callback_user,
+                        dropped,
+                        full_secs = now_ms
+                            .saturating_sub(
+                                full_since_ms.load(std::sync::atomic::Ordering::Relaxed),
+                            )
+                            / 1000,
+                        "Outbound channel still full; dropping messages"
+                    );
                 }
             }
         },
@@ -1217,19 +1251,30 @@ async fn handle_socket(
     // Register the connection with the sync protocol event sender
     sync_protocol_event_sender.register_doc_connection(doc_id.clone(), Arc::downgrade(&connection));
 
-    loop {
+    let close_reason = loop {
         tokio::select! {
-            Some(msg) = stream.next() => {
+            msg = stream.next() => {
+                let Some(msg) = msg else {
+                    // The stream ended without a close handshake. Break instead
+                    // of leaving the branch disabled, which would hold the doc
+                    // and this task alive until server shutdown.
+                    break "stream_eof";
+                };
                 let msg = match msg {
                     Ok(Message::Binary(bytes)) => bytes,
-                    Ok(Message::Close(_)) => break,
+                    Ok(Message::Close(_)) => break "close_frame",
                     Err(_e) => {
                         // The stream will complain about things like
                         // connections being lost without handshake.
                         continue;
                     }
                     msg => {
-                        tracing::warn!(?msg, "Received non-binary message");
+                        tracing::warn!(
+                            doc_id = %doc_id,
+                            user = ?log_user,
+                            ?msg,
+                            "Received non-binary message"
+                        );
                         continue;
                     }
                 };
@@ -1251,19 +1296,32 @@ async fn handle_socket(
                             code: 1008, // Policy Violation - indicates a policy violation
                             reason: "Token expired".into(),
                         })));
-                        break;
+                        break "token_expired";
                     }
                     Err(e) => {
-                        tracing::warn!(?e, "Error handling message");
+                        tracing::warn!(
+                            doc_id = %doc_id,
+                            user = ?log_user,
+                            ?e,
+                            "Error handling message"
+                        );
                     }
                 }
             }
             _ = cancellation_token.cancelled() => {
                 tracing::debug!("Closing doc connection due to server cancel...");
-                break;
+                break "server_shutdown";
             }
         }
-    }
+    };
+
+    tracing::info!(
+        doc_id = %doc_id,
+        user = ?log_user,
+        close_reason,
+        duration_secs = connected_at.elapsed().as_secs(),
+        "WebSocket disconnected"
+    );
 }
 
 async fn check_store(
