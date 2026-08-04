@@ -237,11 +237,13 @@ mod tests {
         assert_eq!(content.spans[0].client_id, Some(doc.client_id().get()));
     }
 
-    /// yrs 0.26 panics splitting at the current snapshot when a client's whole
-    /// stream is one single-unit block; the fallback returns the content
-    /// unattributed instead of failing.
+    /// A client whose whole stream is one single-unit block used to panic
+    /// yrs 0.26's find_pivot (clock / 0) when splitting at the current
+    /// snapshot; our vendored patch (crates/vendor/yrs-0.26.0) fixes that,
+    /// so this now attributes correctly instead of hitting the catch_unwind
+    /// fallback.
     #[test]
-    fn test_single_unit_stream_falls_back_unattributed() {
+    fn test_single_unit_stream_attributes_correctly() {
         let doc = Doc::new();
         let text = doc.get_or_insert_text("contents");
         {
@@ -251,6 +253,6 @@ mod tests {
         let content = attributed_content(&doc, "contents").unwrap();
         assert_eq!(content.spans.len(), 1);
         assert_eq!(content.spans[0].text, "x");
-        assert_eq!(content.spans[0].client_id, None);
+        assert_eq!(content.spans[0].client_id, Some(doc.client_id().get()));
     }
 }

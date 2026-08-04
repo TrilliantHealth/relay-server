@@ -21,3 +21,6 @@ strip = true     # Strip symbols
 [patch.crates-io]
 rusty-s3 = { git = "https://github.com/dtkav/rusty-s3", branch = "main" }
 yrs-kvstore = { path = "yrs-kvstore" }
+# find_pivot panics (clock / 0) on a single one-unit-block client stream; see
+# https://github.com/y-crdt/y-crdt/blob/main/yrs/src/block_store.rs (still present on main).
+yrs = { path = "vendor/yrs-0.26.0" }
