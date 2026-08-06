@@ -22,7 +22,7 @@ use futures::{Sink, SinkExt, Stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{io::Write, sync::Arc, time::Duration};
+use std::{collections::HashSet, io::Write, sync::Arc, time::Duration};
 use tempfile::NamedTempFile;
 use tokio::{
     net::TcpListener,
@@ -137,6 +137,7 @@ fn validate_file_token(
                     "access_wrong_document",
                 ));
             }
+            server_state.check_user_denied(file_permission.user.as_deref())?;
         }
         _ => {
             return Err(AppError::auth(
@@ -243,6 +244,9 @@ pub struct Server {
     event_dispatcher: Option<Arc<dyn EventDispatcher>>,
     sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
     metrics: Arc<RelayMetrics>,
+    /// User ids refused doc/file access at token verification. Tokens
+    /// without a user claim (server tokens) are never affected.
+    denied_users: HashSet<String>,
 }
 
 impl Server {
@@ -313,7 +317,39 @@ impl Server {
             event_dispatcher,
             sync_protocol_event_sender,
             metrics,
+            denied_users: HashSet::new(),
         })
+    }
+
+    pub fn with_denied_users(mut self, users: impl IntoIterator<Item = String>) -> Self {
+        self.denied_users = users.into_iter().collect();
+        if !self.denied_users.is_empty() {
+            tracing::warn!(
+                "Denying doc/file access to {} user id(s): {:?}",
+                self.denied_users.len(),
+                self.denied_users
+            );
+        }
+        self
+    }
+
+    /// 403 if the token's user claim is on the denylist. `None` (server
+    /// tokens, or no authenticator) always passes.
+    fn check_user_denied(&self, user: Option<&str>) -> Result<(), AppError> {
+        if let Some(user) = user {
+            if self.denied_users.contains(user) {
+                tracing::warn!("Denied user {} refused access", user);
+                return Err(AppError::auth(
+                    StatusCode::FORBIDDEN,
+                    anyhow!(
+                        "This account is temporarily blocked from sync; contact your administrator"
+                    ),
+                    "user_denied",
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     /// Close every doc WebSocket: each socket loop breaks, sends its
@@ -1118,6 +1154,8 @@ fn verify_socket_token(
             ));
         }
     };
+
+    server_state.check_user_denied(user.as_deref())?;
 
     Ok((authorization, channel, user))
 }
@@ -2733,6 +2771,62 @@ mod test {
 
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
         assert_eq!(err.auth_error_type, Some("missing_token"));
+    }
+
+    #[tokio::test]
+    async fn test_websocket_auth_denied_user() {
+        let mut authenticator = y_sweet_core::auth::Authenticator::gen_key().unwrap();
+        // CWT verification requires an expected audience (normally server.url).
+        authenticator.set_expected_audience(Some("https://test.example".to_string()));
+        let far_future = ExpirationTimeEpochMillis(4_102_444_800_000); // year 2100
+        let denied_token = authenticator
+            .gen_doc_token_cwt(
+                "test-doc",
+                Authorization::Full,
+                far_future,
+                Some("denied-user"),
+                None,
+            )
+            .unwrap();
+        let allowed_token = authenticator
+            .gen_doc_token_cwt(
+                "test-doc",
+                Authorization::Full,
+                far_future,
+                Some("allowed-user"),
+                None,
+            )
+            .unwrap();
+        let server_token = authenticator.server_token().unwrap();
+        let server_state = Arc::new(
+            Server::new(
+                None,
+                Duration::from_secs(60),
+                Some(authenticator),
+                None,
+                vec![],
+                CancellationToken::new(),
+                true,
+                None,
+            )
+            .await
+            .unwrap()
+            .with_denied_users(["denied-user".to_string()]),
+        );
+
+        let err = verify_socket_token(&server_state, "test-doc", Some(&denied_token)).unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        assert_eq!(err.auth_error_type, Some("user_denied"));
+
+        let (_, _, user) =
+            verify_socket_token(&server_state, "test-doc", Some(&allowed_token)).unwrap();
+        assert_eq!(user, Some("allowed-user".to_string()));
+
+        // Server tokens carry no user claim and must never be denied.
+        let (authorization, _, user) =
+            verify_socket_token(&server_state, "test-doc", Some(&server_token)).unwrap();
+        assert_eq!(authorization, Authorization::Full);
+        assert_eq!(user, None);
     }
 
     #[tokio::test]

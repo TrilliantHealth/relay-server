@@ -299,6 +299,13 @@ pub struct ServerConfig {
 
     #[serde(default = "default_redact_errors")]
     pub redact_errors: bool,
+
+    /// Relay user ids refused doc/file access at token verification.
+    /// A denied client sees the server as unreachable; its local edits
+    /// queue and sync normally once the id is removed. Server tokens
+    /// (no user claim) are never affected.
+    #[serde(default)]
+    pub denied_users: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -590,6 +597,7 @@ impl Default for ServerConfig {
             checkpoint_freq_seconds: default_checkpoint_freq_seconds(),
             doc_gc: default_doc_gc(),
             redact_errors: default_redact_errors(),
+            denied_users: Vec::new(),
         }
     }
 }

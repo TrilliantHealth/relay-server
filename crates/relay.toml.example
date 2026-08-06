@@ -6,6 +6,11 @@ url = "https://api.example.com"  # RELAY_SERVER_URL
 host = "0.0.0.0"                 # RELAY_SERVER_HOST
 port = 8080                      # PORT
 
+# Relay user ids refused doc/file access (403) at token verification.
+# Use to temporarily cut off clients (e.g. pending a plugin upgrade);
+# their local edits queue and sync normally once the id is removed.
+# denied_users = ["someuserid123xy"]
+
 [metrics]
 port = 9090                      # METRICS_PORT
 
