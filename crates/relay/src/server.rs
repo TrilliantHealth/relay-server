@@ -22,7 +22,12 @@ use futures::{Sink, SinkExt, Stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{collections::HashSet, io::Write, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    io::Write,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 use tempfile::NamedTempFile;
 use tokio::{
     net::TcpListener,
@@ -250,6 +255,17 @@ pub struct Server {
     /// When non-empty, doc websocket connections from user-claimed tokens
     /// must report one of these plugin versions (the `v` query param).
     allowed_client_versions: HashSet<String>,
+    /// Blocked clients retry connecting continuously, so denial warns are
+    /// throttled to one line per user per DENIAL_LOG_INTERVAL. Only denied
+    /// user ids ever enter the map, so it stays small.
+    denial_log_throttle: Mutex<HashMap<String, DenialLogState>>,
+}
+
+const DENIAL_LOG_INTERVAL: Duration = Duration::from_secs(300);
+
+struct DenialLogState {
+    last_logged: Instant,
+    suppressed: u64,
 }
 
 impl Server {
@@ -322,6 +338,7 @@ impl Server {
             metrics,
             denied_users: HashSet::new(),
             allowed_client_versions: HashSet::new(),
+            denial_log_throttle: Mutex::new(HashMap::new()),
         })
     }
 
@@ -351,6 +368,35 @@ impl Server {
         self
     }
 
+    /// Some(suppressed_count) when this user's denial should be logged now;
+    /// None when it falls inside the throttle window (the count accrues for
+    /// the next logged line).
+    fn denial_log_permit(&self, user: &str) -> Option<u64> {
+        let mut throttle = self.denial_log_throttle.lock().unwrap();
+        match throttle.get_mut(user) {
+            Some(state) if state.last_logged.elapsed() < DENIAL_LOG_INTERVAL => {
+                state.suppressed += 1;
+                None
+            }
+            Some(state) => {
+                let suppressed = state.suppressed;
+                state.last_logged = Instant::now();
+                state.suppressed = 0;
+                Some(suppressed)
+            }
+            None => {
+                throttle.insert(
+                    user.to_string(),
+                    DenialLogState {
+                        last_logged: Instant::now(),
+                        suppressed: 0,
+                    },
+                );
+                Some(0)
+            }
+        }
+    }
+
     /// 403 unless the client reported a version in allowed_client_versions.
     /// Empty list disables the gate. Connections without a user claim
     /// (server tokens) always pass - they are servers, not plugins.
@@ -359,19 +405,26 @@ impl Server {
         user: Option<&str>,
         version: Option<&str>,
     ) -> Result<(), AppError> {
-        if self.allowed_client_versions.is_empty() || user.is_none() {
+        let Some(user) = user else {
+            return Ok(());
+        };
+        if self.allowed_client_versions.is_empty() {
             return Ok(());
         }
 
         match version {
             Some(v) if self.allowed_client_versions.contains(v) => Ok(()),
             _ => {
-                tracing::warn!(
-                    "Blocked user {:?} on client version {:?} (allowed: {:?})",
-                    user,
-                    version,
-                    self.allowed_client_versions
-                );
+                if let Some(suppressed) = self.denial_log_permit(user) {
+                    tracing::warn!(
+                        "Blocked user {:?} on client version {:?} (allowed: {:?}; {} more denials suppressed in the last {}s)",
+                        user,
+                        version,
+                        self.allowed_client_versions,
+                        suppressed,
+                        DENIAL_LOG_INTERVAL.as_secs()
+                    );
+                }
                 Err(AppError::auth(
                     StatusCode::FORBIDDEN,
                     anyhow!("This plugin version is temporarily blocked from sync; run witchdoctor to upgrade"),
@@ -386,7 +439,14 @@ impl Server {
     fn check_user_denied(&self, user: Option<&str>) -> Result<(), AppError> {
         if let Some(user) = user {
             if self.denied_users.contains(user) {
-                tracing::warn!("Denied user {} refused access", user);
+                if let Some(suppressed) = self.denial_log_permit(user) {
+                    tracing::warn!(
+                        "Denied user {} refused access ({} more denials suppressed in the last {}s)",
+                        user,
+                        suppressed,
+                        DENIAL_LOG_INTERVAL.as_secs()
+                    );
+                }
                 return Err(AppError::auth(
                     StatusCode::FORBIDDEN,
                     anyhow!(
@@ -2968,6 +3028,53 @@ mod test {
         server_state
             .check_client_version(Some("someone"), Some("0.8.7"))
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_denial_log_throttle() {
+        let server_state = Server::new(
+            None,
+            Duration::from_secs(60),
+            None,
+            None,
+            vec![],
+            CancellationToken::new(),
+            true,
+            None,
+        )
+        .await
+        .unwrap()
+        .with_denied_users(["noisy-user".to_string()]);
+
+        // First denial logs (permit with 0 suppressed); repeats within the
+        // window accrue instead of logging.
+        assert_eq!(server_state.denial_log_permit("noisy-user"), Some(0));
+        assert_eq!(server_state.denial_log_permit("noisy-user"), None);
+        assert_eq!(server_state.denial_log_permit("noisy-user"), None);
+
+        // A different user has its own window.
+        assert_eq!(server_state.denial_log_permit("other-user"), Some(0));
+
+        // Expire noisy-user's window: the next permit reports the accrued
+        // count and resets it.
+        server_state
+            .denial_log_throttle
+            .lock()
+            .unwrap()
+            .get_mut("noisy-user")
+            .unwrap()
+            .last_logged = Instant::now() - DENIAL_LOG_INTERVAL;
+        assert_eq!(server_state.denial_log_permit("noisy-user"), Some(2));
+        assert_eq!(server_state.denial_log_permit("noisy-user"), None);
+
+        // The denial check itself still refuses every attempt, throttled or not.
+        for _ in 0..3 {
+            let err = server_state
+                .check_user_denied(Some("noisy-user"))
+                .unwrap_err();
+            assert_eq!(err.status, StatusCode::FORBIDDEN);
+            assert_eq!(err.auth_error_type, Some("user_denied"));
+        }
     }
 
     #[tokio::test]
