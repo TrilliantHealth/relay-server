@@ -11,6 +11,11 @@ port = 8080                      # PORT
 # their local edits queue and sync normally once the id is removed.
 # denied_users = ["someuserid123xy"]
 
+# When non-empty, doc websocket clients must report one of these plugin
+# versions (v query param, sent by plugin >= 0.8.8-th.6); older clients
+# that report nothing are blocked. Server tokens are exempt.
+# allowed_client_versions = ["0.8.8-th.6"]
+
 [metrics]
 port = 9090                      # METRICS_PORT
 

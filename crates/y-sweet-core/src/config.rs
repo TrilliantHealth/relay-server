@@ -306,6 +306,13 @@ pub struct ServerConfig {
     /// (no user claim) are never affected.
     #[serde(default)]
     pub denied_users: Vec<String>,
+
+    /// When non-empty, doc websocket connections must report one of these
+    /// plugin versions (`v` query param, sent by clients >= 0.8.8-th.6);
+    /// anything else - including clients too old to report - gets 403.
+    /// Server tokens are exempt. Empty = no version gating.
+    #[serde(default)]
+    pub allowed_client_versions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -598,6 +605,7 @@ impl Default for ServerConfig {
             doc_gc: default_doc_gc(),
             redact_errors: default_redact_errors(),
             denied_users: Vec::new(),
+            allowed_client_versions: Vec::new(),
         }
     }
 }

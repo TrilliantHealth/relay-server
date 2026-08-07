@@ -247,6 +247,9 @@ pub struct Server {
     /// User ids refused doc/file access at token verification. Tokens
     /// without a user claim (server tokens) are never affected.
     denied_users: HashSet<String>,
+    /// When non-empty, doc websocket connections from user-claimed tokens
+    /// must report one of these plugin versions (the `v` query param).
+    allowed_client_versions: HashSet<String>,
 }
 
 impl Server {
@@ -318,7 +321,22 @@ impl Server {
             sync_protocol_event_sender,
             metrics,
             denied_users: HashSet::new(),
+            allowed_client_versions: HashSet::new(),
         })
+    }
+
+    pub fn with_allowed_client_versions(
+        mut self,
+        versions: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.allowed_client_versions = versions.into_iter().collect();
+        if !self.allowed_client_versions.is_empty() {
+            tracing::warn!(
+                "Requiring client version in {:?} for doc websocket access",
+                self.allowed_client_versions
+            );
+        }
+        self
     }
 
     pub fn with_denied_users(mut self, users: impl IntoIterator<Item = String>) -> Self {
@@ -331,6 +349,36 @@ impl Server {
             );
         }
         self
+    }
+
+    /// 403 unless the client reported a version in allowed_client_versions.
+    /// Empty list disables the gate. Connections without a user claim
+    /// (server tokens) always pass - they are servers, not plugins.
+    fn check_client_version(
+        &self,
+        user: Option<&str>,
+        version: Option<&str>,
+    ) -> Result<(), AppError> {
+        if self.allowed_client_versions.is_empty() || user.is_none() {
+            return Ok(());
+        }
+
+        match version {
+            Some(v) if self.allowed_client_versions.contains(v) => Ok(()),
+            _ => {
+                tracing::warn!(
+                    "Blocked user {:?} on client version {:?} (allowed: {:?})",
+                    user,
+                    version,
+                    self.allowed_client_versions
+                );
+                Err(AppError::auth(
+                    StatusCode::FORBIDDEN,
+                    anyhow!("This plugin version is temporarily blocked from sync; run witchdoctor to upgrade"),
+                    "client_version_blocked",
+                ))
+            }
+        }
     }
 
     /// 403 if the token's user claim is on the denylist. `None` (server
@@ -929,6 +977,9 @@ impl Server {
 #[derive(Deserialize)]
 struct HandlerParams {
     token: Option<String>,
+    /// Plugin version, reported by clients >= 0.8.8-th.6. Absent on older
+    /// clients - which is exactly what allowed_client_versions gates on.
+    v: Option<String>,
 }
 
 async fn get_doc_as_update(
@@ -1171,6 +1222,7 @@ async fn handle_socket_upgrade_deprecated(
     );
     let (authorization, channel, user) =
         verify_socket_token(&server_state, &doc_id, params.token.as_deref())?;
+    server_state.check_client_version(user.as_deref(), params.v.as_deref())?;
 
     handle_socket_upgrade_with_channel_and_user(
         ws,
@@ -1202,6 +1254,7 @@ async fn handle_socket_upgrade_full_path(
 
     let (authorization, channel, user) =
         verify_socket_token(&server_state, &doc_id, params.token.as_deref())?;
+    server_state.check_client_version(user.as_deref(), params.v.as_deref())?;
 
     handle_socket_upgrade_with_channel_and_user(
         ws,
@@ -2827,6 +2880,94 @@ mod test {
             verify_socket_token(&server_state, "test-doc", Some(&server_token)).unwrap();
         assert_eq!(authorization, Authorization::Full);
         assert_eq!(user, None);
+    }
+
+    #[tokio::test]
+    async fn test_client_version_gate() {
+        let mut authenticator = y_sweet_core::auth::Authenticator::gen_key().unwrap();
+        authenticator.set_expected_audience(Some("https://test.example".to_string()));
+        let far_future = ExpirationTimeEpochMillis(4_102_444_800_000); // year 2100
+        let user_token = authenticator
+            .gen_doc_token_cwt(
+                "test-doc",
+                Authorization::Full,
+                far_future,
+                Some("someone"),
+                None,
+            )
+            .unwrap();
+        let server_token = authenticator.server_token().unwrap();
+        let server_state = Arc::new(
+            Server::new(
+                None,
+                Duration::from_secs(60),
+                Some(authenticator),
+                None,
+                vec![],
+                CancellationToken::new(),
+                true,
+                None,
+            )
+            .await
+            .unwrap()
+            .with_allowed_client_versions(["0.8.8-th.6".to_string()]),
+        );
+
+        let (_, _, user) =
+            verify_socket_token(&server_state, "test-doc", Some(&user_token)).unwrap();
+        assert_eq!(user, Some("someone".to_string()));
+
+        // Reporting an allowed version passes.
+        server_state
+            .check_client_version(user.as_deref(), Some("0.8.8-th.6"))
+            .unwrap();
+
+        // No version (an old client) is blocked.
+        let err = server_state
+            .check_client_version(user.as_deref(), None)
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        assert_eq!(err.auth_error_type, Some("client_version_blocked"));
+
+        // A version not on the list is blocked.
+        let err = server_state
+            .check_client_version(user.as_deref(), Some("0.8.7"))
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+
+        // Server tokens (no user claim) are exempt regardless of version.
+        let (_, _, no_user) =
+            verify_socket_token(&server_state, "test-doc", Some(&server_token)).unwrap();
+        assert_eq!(no_user, None);
+        server_state
+            .check_client_version(no_user.as_deref(), None)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_client_version_gate_disabled_when_empty() {
+        let server_state = Arc::new(
+            Server::new(
+                None,
+                Duration::from_secs(60),
+                None,
+                None,
+                vec![],
+                CancellationToken::new(),
+                true,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+
+        // Empty list: everyone passes, version or not.
+        server_state
+            .check_client_version(Some("someone"), None)
+            .unwrap();
+        server_state
+            .check_client_version(Some("someone"), Some("0.8.7"))
+            .unwrap();
     }
 
     #[tokio::test]

@@ -929,7 +929,8 @@ async fn main() -> Result<()> {
                 webhook_configs,
             )
             .await?
-            .with_denied_users(config.server.denied_users.iter().cloned());
+            .with_denied_users(config.server.denied_users.iter().cloned())
+            .with_allowed_client_versions(config.server.allowed_client_versions.iter().cloned());
 
             let redact_errors = config.server.redact_errors;
             let server = Arc::new(server);
