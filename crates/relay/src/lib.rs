@@ -7,6 +7,7 @@ pub mod doc_inspect;
 pub mod doc_lifecycle;
 pub mod doc_restore;
 pub mod doc_versions;
+pub mod edit_author;
 pub mod migrations;
 pub mod server;
 pub mod stores;

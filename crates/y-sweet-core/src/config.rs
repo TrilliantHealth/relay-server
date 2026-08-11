@@ -313,6 +313,13 @@ pub struct ServerConfig {
     /// Server tokens are exempt. Empty = no version gating.
     #[serde(default)]
     pub allowed_client_versions: Vec<String>,
+
+    /// Relay user id -> display name, for log readability only. The server has
+    /// no other source for a name: tokens carry an opaque id and nothing else.
+    /// Ids absent from the map log `name=<none>`, and an empty map behaves the
+    /// same as not configuring one. Never consulted for authorization.
+    #[serde(default)]
+    pub user_names: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -606,6 +613,7 @@ impl Default for ServerConfig {
             redact_errors: default_redact_errors(),
             denied_users: Vec::new(),
             allowed_client_versions: Vec::new(),
+            user_names: HashMap::new(),
         }
     }
 }
@@ -1230,5 +1238,38 @@ public_key = "test-public-key"
         let (key, types) = parse_auth_env_value("abc123base64key==").unwrap();
         assert_eq!(key, "abc123base64key==");
         assert_eq!(types, default_allowed_token_types());
+    }
+
+    #[test]
+    fn user_names_parse_from_a_server_subtable() {
+        let config: Config = toml::from_str(
+            r#"
+[server]
+url = "https://example.com"
+
+[server.user_names]
+"abc123" = "Ada Lovelace"
+"#,
+        )
+        .expect("config with a user_names table must parse");
+
+        assert_eq!(
+            config.server.user_names.get("abc123").map(String::as_str),
+            Some("Ada Lovelace")
+        );
+        assert_eq!(config.server.user_names.get("nobody"), None);
+    }
+
+    #[test]
+    fn user_names_are_optional() {
+        let config: Config = toml::from_str(
+            r#"
+[server]
+url = "https://example.com"
+"#,
+        )
+        .expect("a config with no user_names must still parse");
+
+        assert!(config.server.user_names.is_empty());
     }
 }

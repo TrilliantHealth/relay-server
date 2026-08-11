@@ -85,6 +85,15 @@ pub struct DocConnection {
 
     /// Document ID, for log context only.
     doc_id: Option<String>,
+
+    /// The doc's path within its shared folder, for log context only. Resolved
+    /// by the caller, which owns the folder index; a GUID alone does not tell an
+    /// operator which note a deletion hit.
+    vpath: Option<String>,
+
+    /// Display name for `user`, for log context only. The caller owns the
+    /// id -> name map; None logs `<none>`.
+    user_name: Option<String>,
 }
 
 impl DocConnection {
@@ -234,6 +243,8 @@ impl DocConnection {
             sync_kv: None,
             user: None,
             doc_id: None,
+            vpath: None,
+            user_name: None,
         }
     }
 
@@ -249,6 +260,14 @@ impl DocConnection {
 
     pub fn set_doc_id(&mut self, doc_id: String) {
         self.doc_id = Some(doc_id);
+    }
+
+    pub fn set_vpath(&mut self, vpath: String) {
+        self.vpath = Some(vpath);
+    }
+
+    pub fn set_user_name(&mut self, user_name: String) {
+        self.user_name = Some(user_name);
     }
 
     /// Log when this connection's update grew the doc's delete set by
@@ -271,10 +290,15 @@ impl DocConnection {
         if deleted_clock_span >= LARGE_DELETION_CLOCK_SPAN {
             newly_deleted.sort_by_key(|(_, growth)| std::cmp::Reverse(*growth));
             newly_deleted.truncate(10);
+            // Readable fields first: the doc id is 73 characters and pushes
+            // everything after it off a terminal. `?` on the Options would
+            // render Some("...") and defeat a grep for the bare value.
             tracing::info!(
-                doc_id = ?self.doc_id,
-                user = ?self.user,
+                vpath = %self.vpath.as_deref().unwrap_or("-"),
+                name = %self.user_name.as_deref().unwrap_or("<none>"),
+                user = %self.user.as_deref().unwrap_or("-"),
                 deleted_clock_span,
+                doc_id = %self.doc_id.as_deref().unwrap_or("-"),
                 top_deleted_from = ?newly_deleted,
                 "Update applied a large deletion"
             );

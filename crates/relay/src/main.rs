@@ -930,7 +930,14 @@ async fn main() -> Result<()> {
             )
             .await?
             .with_denied_users(config.server.denied_users.iter().cloned())
-            .with_allowed_client_versions(config.server.allowed_client_versions.iter().cloned());
+            .with_allowed_client_versions(config.server.allowed_client_versions.iter().cloned())
+            .with_user_names(
+                config
+                    .server
+                    .user_names
+                    .iter()
+                    .map(|(id, name)| (id.clone(), name.clone())),
+            );
 
             let redact_errors = config.server.redact_errors;
             let server = Arc::new(server);

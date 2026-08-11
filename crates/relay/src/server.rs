@@ -1,4 +1,5 @@
 use crate::doc_lifecycle::{AttachGuard, AttachKind, DocRegistry, LifecycleConfig};
+use crate::edit_author;
 use crate::vpath_index::VPathIndex;
 use anyhow::{anyhow, Result};
 use axum::{
@@ -263,6 +264,9 @@ pub struct Server {
     /// Resolves the doc GUIDs carried by log lines to the vpaths their shared
     /// folder lists them under.
     vpath_index: Arc<VPathIndex>,
+    /// Relay user id -> display name, for log readability. Empty unless
+    /// configured; a missing id logs `name=<none>`.
+    user_names: Arc<HashMap<String, String>>,
 }
 
 const DENIAL_LOG_INTERVAL: Duration = Duration::from_secs(300);
@@ -344,6 +348,7 @@ impl Server {
             allowed_client_versions: HashSet::new(),
             denial_log_throttle: Mutex::new(HashMap::new()),
             vpath_index: Arc::new(VPathIndex::default()),
+            user_names: Arc::new(HashMap::new()),
         })
     }
 
@@ -358,6 +363,18 @@ impl Server {
                 self.allowed_client_versions
             );
         }
+        self
+    }
+
+    pub fn with_user_names(
+        mut self,
+        names: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        let names: HashMap<String, String> = names.into_iter().collect();
+        if !names.is_empty() {
+            tracing::info!("Loaded display names for {} user id(s)", names.len());
+        }
+        self.user_names = Arc::new(names);
         self
     }
 
@@ -624,6 +641,7 @@ impl Server {
             let user_for_callback = user.clone();
             let registry = self.registry.clone();
             let vpath_index = self.vpath_index.clone();
+            let user_names = self.user_names.clone();
             let doc_id_for_callback = doc_id.to_string();
             // The parent pin lives in this closure, which the doc owns via
             // its SyncKv observer: the guard detaches when the doc drops.
@@ -681,9 +699,18 @@ impl Server {
                                 vpath_index.sync_membership_from_snapshot(channel, state)
                             })
                         {
+                            // Same resolution as "Doc edited": event.user is the
+                            // folder doc's first-load identity, not whoever made
+                            // this change.
+                            let by = match (&event.update, &event.state) {
+                                (Some(update), Some(state)) => {
+                                    edit_author::user_from_snapshot(state, update)
+                                }
+                                _ => None,
+                            };
+                            let by = by.as_deref().or(event.user.as_deref());
+
                             tracing::info!(
-                                channel = %channel,
-                                user = %event.user.as_deref().unwrap_or("-"),
                                 added = %delta.added.join(","),
                                 removed = %delta.removed.join(","),
                                 moved = %delta
@@ -692,6 +719,20 @@ impl Server {
                                     .map(|(from, to)| format!("{from}->{to}"))
                                     .collect::<Vec<_>>()
                                     .join(","),
+                                name = %by
+                                    .and_then(|id| user_names.get(id))
+                                    .map(String::as_str)
+                                    .unwrap_or("<none>"),
+                                user = %by.unwrap_or("-"),
+                                // One id per device+session, so a file that
+                                // comes back after a delete can be traced to
+                                // the client that republished it.
+                                clients = %event
+                                    .update
+                                    .as_deref()
+                                    .map(edit_author::clients_for_update)
+                                    .unwrap_or_else(|| "-".to_string()),
+                                channel = %channel,
                                 "Folder membership changed"
                             );
                         }
@@ -703,15 +744,36 @@ impl Server {
                     let vpath = folder
                         .and_then(|folder| vpath_index.resolve(channel, &folder, edited_doc_id));
 
+                    // event.user is the callback's captured identity, which
+                    // describes whichever connection first loaded the doc.
+                    // Resolving the update's own client ids against the doc's
+                    // PUD map names the person who actually made this edit.
+                    // Read from the snapshot, not the live doc, for the same
+                    // lock reason as the membership diff.
+                    let author = match (&event.update, &event.state) {
+                        (Some(update), Some(state)) => {
+                            edit_author::user_from_snapshot(state, update)
+                        }
+                        _ => None,
+                    };
+
                     // The only per-user record of content change. Doc opens and
                     // evictions are debug; this is what an operator reads to answer
                     // "who changed something, and was it a keystroke or a rewrite".
+                    // Field order is for a human reading a terminal: the two
+                    // ids are 73 characters each and would push everything
+                    // legible off the right edge.
+                    let user_id = author.as_deref().or(event.user.as_deref());
                     tracing::info!(
-                        doc_id = %edited_doc_id,
                         vpath = %vpath.as_deref().unwrap_or("-"),
-                        user = %event.user.as_deref().unwrap_or("-"),
-                        channel = %channel,
+                        name = %user_id
+                            .and_then(|id| user_names.get(id))
+                            .map(String::as_str)
+                            .unwrap_or("<none>"),
+                        user = %user_id.unwrap_or("-"),
                         update_bytes = event.update.as_ref().map_or(0, Vec::len),
+                        doc_id = %edited_doc_id,
+                        channel = %channel,
                         "Doc edited"
                     );
 
@@ -738,6 +800,27 @@ impl Server {
             event_callback,
         )
         .await?;
+
+        // First receipt of a brand-new doc: nothing in the store held state
+        // for this id. Logged with the authenticated user so surprise
+        // identities (e.g. republished deletions) are attributable from
+        // server logs alone.
+        if dwskv.sync_kv().created() {
+            // No vpath: the parent folder learns the new guid in a separate
+            // update that has not necessarily arrived yet, so the path is only
+            // knowable once it does.
+            tracing::info!(
+                name = %user
+                    .as_deref()
+                    .and_then(|id| self.user_names.get(id))
+                    .map(String::as_str)
+                    .unwrap_or("<none>"),
+                user = %user.as_deref().unwrap_or("-"),
+                doc_id = %doc_id,
+                channel = %routing_channel_name,
+                "New doc created: first receipt of this id"
+            );
+        }
 
         // If channel is provided in token, store it in document metadata
         if let Some(channel_name) = routing_channel {
@@ -1260,10 +1343,23 @@ async fn handle_socket_upgrade_with_channel_and_user(
     };
 
     let user_for_pud = user.clone();
+    let channel_for_vpath = routing_channel.clone();
     let guard = server_state
         .attach_doc(&doc_id, AttachKind::Socket, routing_channel, user)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    // Resolved once per connection rather than per deletion: attach_doc has
+    // loaded and pinned the parent folder by now, and a doc does not change
+    // path mid-socket often enough to justify re-resolving on every update.
+    let vpath = channel_for_vpath.as_deref().and_then(|channel| {
+        server_state.registry.peek(channel).and_then(|folder| {
+            server_state.vpath_index.resolve(channel, &folder, &doc_id)
+        })
+    });
+    let user_name = user_for_pud
+        .as_deref()
+        .and_then(|id| server_state.user_names.get(id))
+        .cloned();
     // Socket loops watch the doc-close token (a child of the server token)
     // so shutdown can close them ahead of the graceful drain.
     let cancellation_token = server_state.doc_close_token.clone();
@@ -1283,6 +1379,8 @@ async fn handle_socket_upgrade_with_channel_and_user(
             cancellation_token,
             sync_protocol_event_sender,
             doc_id_clone,
+            vpath,
+            user_name,
             metrics,
         )
     }))
@@ -1414,6 +1512,8 @@ async fn handle_socket(
     cancellation_token: CancellationToken,
     sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
     doc_id: String,
+    vpath: Option<String>,
+    user_name: Option<String>,
     metrics: Arc<RelayMetrics>,
 ) {
     let (sink, stream) = socket.split();
@@ -1427,6 +1527,8 @@ async fn handle_socket(
         cancellation_token,
         sync_protocol_event_sender,
         doc_id,
+        vpath,
+        user_name,
         metrics,
     )
     .await
@@ -1445,6 +1547,8 @@ async fn handle_socket_inner<S, T, E>(
     cancellation_token: CancellationToken,
     sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
     doc_id: String,
+    vpath: Option<String>,
+    user_name: Option<String>,
     metrics: Arc<RelayMetrics>,
 ) where
     S: Sink<Message> + Send + Unpin + 'static,
@@ -1553,6 +1657,12 @@ async fn handle_socket_inner<S, T, E>(
     );
     conn.set_sync_kv(sync_kv);
     conn.set_doc_id(doc_id.clone());
+    if let Some(vpath) = vpath {
+        conn.set_vpath(vpath);
+    }
+    if let Some(user_name) = user_name {
+        conn.set_user_name(user_name);
+    }
     if let Some(user) = user {
         conn.set_user(user);
     }
@@ -1674,11 +1784,19 @@ async fn handle_socket_inner<S, T, E>(
     };
 
     // Clients hold one socket per doc and cycle them on a fixed interval - a
-    // vault this size produces over a thousand clean closes an hour, clustered
-    // at the cycle length rather than spread out. None of it is actionable, so
-    // only an abnormal close reason stays at info.
+    // vault this size produces over a thousand closes an hour, clustered at the
+    // cycle length rather than spread out. None of it is actionable, so only a
+    // close reason the client did not choose stays at info.
+    //
+    // `stream_eof` is on that list despite reading as abnormal: Obsidian
+    // clients drop the socket without a close frame when a laptop sleeps or a
+    // note closes, so it is the ordinary way a client goes away. Measured
+    // 2026-08-10: 115 of them across 22 users in 23 minutes, 85% lasting five
+    // minutes or more - session churn, not faults, and 62% of all info volume.
+    // A single client cycling pathologically is still visible in
+    // `record_websocket_close` and by enabling this target for an hour.
     let duration_secs = connected_at.elapsed().as_secs();
-    if close_reason == "close_frame" {
+    if close_reason == "close_frame" || close_reason == "stream_eof" {
         tracing::debug!(
             doc_id = %doc_id,
             user = %log_user,
@@ -4202,6 +4320,8 @@ mod test {
                 server_token,
                 Arc::new(SyncProtocolEventSender::new()),
                 "test_doc".to_string(),
+                None,
+                None,
                 metrics.clone(),
             ));
 
