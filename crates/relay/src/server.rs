@@ -1,4 +1,5 @@
 use crate::doc_lifecycle::{AttachGuard, AttachKind, DocRegistry, LifecycleConfig};
+use crate::vpath_index::VPathIndex;
 use anyhow::{anyhow, Result};
 use axum::{
     body::Bytes,
@@ -259,6 +260,9 @@ pub struct Server {
     /// throttled to one line per user per DENIAL_LOG_INTERVAL. Only denied
     /// user ids ever enter the map, so it stays small.
     denial_log_throttle: Mutex<HashMap<String, DenialLogState>>,
+    /// Resolves the doc GUIDs carried by log lines to the vpaths their shared
+    /// folder lists them under.
+    vpath_index: Arc<VPathIndex>,
 }
 
 const DENIAL_LOG_INTERVAL: Duration = Duration::from_secs(300);
@@ -339,6 +343,7 @@ impl Server {
             denied_users: HashSet::new(),
             allowed_client_versions: HashSet::new(),
             denial_log_throttle: Mutex::new(HashMap::new()),
+            vpath_index: Arc::new(VPathIndex::default()),
         })
     }
 
@@ -618,6 +623,7 @@ impl Server {
             let routing_channel_for_callback = routing_channel_name.clone();
             let user_for_callback = user.clone();
             let registry = self.registry.clone();
+            let vpath_index = self.vpath_index.clone();
             let doc_id_for_callback = doc_id.to_string();
             // The parent pin lives in this closure, which the doc owns via
             // its SyncKv observer: the guard detaches when the doc drops.
@@ -642,17 +648,69 @@ impl Server {
                         }
                     }
 
+                    // Adds, removes and renames arrive as ordinary updates to
+                    // the folder doc's filemeta map, so only a diff of that map
+                    // says which happened. The diff consumes the cached
+                    // mapping that resolve() would otherwise read, hence the
+                    // split: folder edits report membership, child edits
+                    // resolve their own path.
+                    //
+                    // Both values come off the event, not the closure: the
+                    // callback is built once when the doc loads and reused for
+                    // every later update, so its captured doc_id and channel
+                    // describe that first load rather than the edit in hand.
+                    let edited_doc_id = event.doc_id.as_str();
+                    let channel = event
+                        .metadata
+                        .get("channel")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(&routing_channel_for_callback);
+
+                    let editing_folder_doc = channel == edited_doc_id;
+                    let folder = if editing_folder_doc {
+                        None
+                    } else {
+                        registry.peek(channel)
+                    };
+
+                    if editing_folder_doc {
+                        if let Some(delta) = event
+                            .state
+                            .as_deref()
+                            .and_then(|state| {
+                                vpath_index.sync_membership_from_snapshot(channel, state)
+                            })
+                        {
+                            tracing::info!(
+                                channel = %channel,
+                                user = %event.user.as_deref().unwrap_or("-"),
+                                added = %delta.added.join(","),
+                                removed = %delta.removed.join(","),
+                                moved = %delta
+                                    .moved
+                                    .iter()
+                                    .map(|(from, to)| format!("{from}->{to}"))
+                                    .collect::<Vec<_>>()
+                                    .join(","),
+                                "Folder membership changed"
+                            );
+                        }
+                    }
+
+                    // `vpath` is the note's path within its shared folder; it is
+                    // "-" when the folder doc is not resident or does not list
+                    // this child, which is why doc_id stays on the line.
+                    let vpath = folder
+                        .and_then(|folder| vpath_index.resolve(channel, &folder, edited_doc_id));
+
                     // The only per-user record of content change. Doc opens and
                     // evictions are debug; this is what an operator reads to answer
                     // "who changed something, and was it a keystroke or a rewrite".
                     tracing::info!(
-                        doc_id = %event.doc_id,
+                        doc_id = %edited_doc_id,
+                        vpath = %vpath.as_deref().unwrap_or("-"),
                         user = %event.user.as_deref().unwrap_or("-"),
-                        channel = %event
-                            .metadata
-                            .get("channel")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("-"),
+                        channel = %channel,
                         update_bytes = event.update.as_ref().map_or(0, Vec::len),
                         "Doc edited"
                     );
@@ -3720,6 +3778,111 @@ mod test {
             assert!(
                 !server.registry.is_resident(&doc_id),
                 "with the last attachment gone the idle deadline must evict"
+            );
+        }
+
+        /// End-to-end shape of the vpath lookup: a child doc routed to a
+        /// parent channel whose filemeta_v0 lists it. Exercises the same
+        /// registry lookup the update callback performs, which unit tests on
+        /// VPathIndex alone cannot reach.
+        #[tokio::test]
+        async fn child_edit_resolves_its_vpath_through_the_registry() {
+            let store = MemoryStore::new();
+            let server = test_server(
+                Some(Box::new(store.clone())),
+                Duration::from_millis(10),
+                true,
+                CancellationToken::new(),
+            )
+            .await;
+
+            let parent_id = "parent-doc";
+            let child_guid = "child-doc";
+            server
+                .get_or_create_doc_with_channel(child_guid, Some(parent_id.to_string()))
+                .await
+                .unwrap();
+
+            let parent = server.registry.peek(parent_id).expect("parent resident");
+            {
+                use yrs::{Map as _, Transact as _};
+                let aw = parent.awareness();
+                let aw = aw.read().unwrap();
+                let map = aw.doc().get_or_insert_map("filemeta_v0");
+                let mut txn = aw.doc().transact_mut();
+                map.insert(
+                    &mut txn,
+                    "notes/child.md",
+                    yrs::Any::from(std::collections::HashMap::from([(
+                        "id".to_string(),
+                        yrs::Any::String(child_guid.into()),
+                    )])),
+                );
+            }
+
+            assert_eq!(
+                server.vpath_index.resolve(parent_id, &parent, child_guid),
+                Some("notes/child.md".to_string()),
+                "the callback resolves against the parent it peeks from the registry"
+            );
+        }
+
+        /// The production case the in-memory test misses: the parent folder
+        /// is loaded from the store on demand, so its filemeta_v0 arrives as
+        /// persisted state rather than an in-process insert.
+        #[tokio::test]
+        async fn vpath_resolves_when_the_parent_is_loaded_from_the_store() {
+            use yrs::{Map as _, Transact as _};
+            let store = MemoryStore::new();
+            let parent_id = "parent-doc";
+            let child_guid = "child-doc";
+
+            {
+                let server = test_server(
+                    Some(Box::new(store.clone())),
+                    Duration::from_millis(10),
+                    true,
+                    CancellationToken::new(),
+                )
+                .await;
+                let parent = server
+                    .get_or_create_doc(parent_id)
+                    .await
+                    .expect("parent loads");
+                {
+                    let aw = parent.awareness();
+                    let aw = aw.read().unwrap();
+                    let map = aw.doc().get_or_insert_map("filemeta_v0");
+                    let mut txn = aw.doc().transact_mut();
+                    map.insert(
+                        &mut txn,
+                        "notes/child.md",
+                        yrs::Any::from(std::collections::HashMap::from([(
+                            "id".to_string(),
+                            yrs::Any::String(child_guid.into()),
+                        )])),
+                    );
+                }
+                parent.sync_kv().persist().await.expect("persisted");
+            }
+
+            let server = test_server(
+                Some(Box::new(store.clone())),
+                Duration::from_millis(10),
+                true,
+                CancellationToken::new(),
+            )
+            .await;
+            server
+                .get_or_create_doc_with_channel(child_guid, Some(parent_id.to_string()))
+                .await
+                .unwrap();
+
+            let parent = server.registry.peek(parent_id).expect("parent resident");
+            assert_eq!(
+                server.vpath_index.resolve(parent_id, &parent, child_guid),
+                Some("notes/child.md".to_string()),
+                "a parent rehydrated from the store must still resolve its children"
             );
         }
 
