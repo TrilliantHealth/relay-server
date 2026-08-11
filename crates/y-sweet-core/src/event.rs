@@ -87,6 +87,12 @@ pub struct DocumentUpdatedEvent {
     pub update: Option<Vec<u8>>,
     #[serde(skip)] // Internal use only: encoded snapshot after this update
     pub snapshot: Option<Vec<u8>>,
+    /// The whole document encoded as an update, post-change. Unlike
+    /// `snapshot` (a yrs Snapshot: state vector + delete set) this can be
+    /// decoded back into a readable doc, which is what a consumer needs to
+    /// inspect content without touching the live doc's lock.
+    #[serde(skip)]
+    pub state: Option<Vec<u8>>,
 }
 
 impl DocumentUpdatedEvent {
@@ -98,6 +104,7 @@ impl DocumentUpdatedEvent {
             metadata: BTreeMap::new(),
             update: None,
             snapshot: None,
+            state: None,
         }
     }
 
@@ -113,7 +120,12 @@ impl DocumentUpdatedEvent {
         self
     }
 
-    /// Builder method to add encoded Yjs snapshot
+    /// Builder method to add the post-update document state
+    pub fn with_state(mut self, state: Vec<u8>) -> Self {
+        self.state = Some(state);
+        self
+    }
+
     pub fn with_snapshot(mut self, snapshot: Vec<u8>) -> Self {
         self.snapshot = Some(snapshot);
         self
@@ -483,7 +495,10 @@ impl WebhookSender {
             Ok(response) => {
                 if response.status().is_success() {
                     metrics.record_webhook_request(&config.prefix, "success", duration);
-                    info!(
+                    // One per delivered event, so it tracks the edit rate exactly
+                    // and says nothing the success metric does not already carry.
+                    // Failures below stay at error.
+                    debug!(
                         "Webhook sent successfully for event {} (channel {}) to prefix '{}'",
                         envelope.event_id, envelope.channel, config.prefix
                     );

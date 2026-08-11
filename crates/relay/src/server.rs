@@ -417,12 +417,19 @@ impl Server {
             _ => {
                 if let Some(suppressed) = self.denial_log_permit(user) {
                     tracing::warn!(
-                        "Blocked user {:?} on client version {:?} (allowed: {:?}; {} more denials suppressed in the last {}s)",
-                        user,
-                        version,
-                        self.allowed_client_versions,
+                        user = %user,
+                        // Old builds report nothing at all, and "which of these
+                        // is version-less" drives who needs a manual upgrade.
+                        version = %version.unwrap_or("none"),
+                        allowed = %self
+                            .allowed_client_versions
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(","),
                         suppressed,
-                        DENIAL_LOG_INTERVAL.as_secs()
+                        interval_secs = DENIAL_LOG_INTERVAL.as_secs(),
+                        "Blocked user on client version"
                     );
                 }
                 Err(AppError::auth(
@@ -534,7 +541,7 @@ impl Server {
     pub async fn create_doc(&self) -> Result<String> {
         let doc_id = nanoid::nanoid!();
         self.load_doc(&doc_id, None).await?;
-        tracing::info!(doc_id=?doc_id, "Created doc");
+        tracing::info!(doc_id = %doc_id, "Created doc");
         Ok(doc_id)
     }
 
@@ -635,18 +642,20 @@ impl Server {
                         }
                     }
 
-                    // Log the full event payload as JSON after user assignment
-                    match serde_json::to_string(&event) {
-                        Ok(json_str) => {
-                            tracing::info!("Document updated event dispatched: {}", json_str);
-                        }
-                        Err(e) => {
-                            tracing::info!(
-                                "Document updated event dispatched for doc_id: {} (JSON serialization failed: {})",
-                                event.doc_id, e
-                            );
-                        }
-                    }
+                    // The only per-user record of content change. Doc opens and
+                    // evictions are debug; this is what an operator reads to answer
+                    // "who changed something, and was it a keystroke or a rewrite".
+                    tracing::info!(
+                        doc_id = %event.doc_id,
+                        user = %event.user.as_deref().unwrap_or("-"),
+                        channel = %event
+                            .metadata
+                            .get("channel")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("-"),
+                        update_bytes = event.update.as_ref().map_or(0, Vec::len),
+                        "Doc edited"
+                    );
 
                     // Step 1: Create the envelope with predetermined routing channel
                     let envelope = EventEnvelope::new(routing_channel_for_callback.clone(), event);
@@ -791,7 +800,12 @@ impl Server {
                 let routing_channel = routing_channel.clone();
                 let user = user.clone();
                 async move {
-                    tracing::info!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc");
+                    tracing::debug!(
+                        doc_id = %doc_id,
+                        channel = %routing_channel.as_deref().unwrap_or("-"),
+                        user = %user.as_deref().unwrap_or("-"),
+                        "Loading doc"
+                    );
                     self.build_doc(doc_id, routing_channel, user).await
                 }
             })
@@ -815,7 +829,12 @@ impl Server {
                 let routing_channel = routing_channel.clone();
                 let user = user.clone();
                 async move {
-                    tracing::info!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc");
+                    tracing::debug!(
+                        doc_id = %doc_id,
+                        channel = %routing_channel.as_deref().unwrap_or("-"),
+                        user = %user.as_deref().unwrap_or("-"),
+                        "Loading doc"
+                    );
                     self.build_doc(doc_id, routing_channel, user).await
                 }
             })
@@ -1378,7 +1397,7 @@ async fn handle_socket_inner<S, T, E>(
     let sync_kv = guard.sync_kv();
     let (send, mut recv) = channel(1024);
     let connected_at = std::time::Instant::now();
-    tracing::debug!(doc_id = %doc_id, user = ?user, "WebSocket connected");
+    tracing::debug!(doc_id = %doc_id, user = %user.as_deref().unwrap_or("-"), "WebSocket connected");
 
     // Cancelled when the writer task exits (sink write failure) or when the
     // parent server token cancels. The read loop selects on it so the
@@ -1400,7 +1419,9 @@ async fn handle_socket_inner<S, T, E>(
     let metrics_clone = metrics.clone();
     let callback_doc_id = doc_id.clone();
     let callback_user = user.clone();
-    let log_user = user.clone();
+    // "-" rather than None so every line in this handler reads the same whether
+    // or not the socket carried an identity.
+    let log_user = user.clone().unwrap_or_else(|| "-".to_string());
     // A wedged client can stay full for hours; per-message warns have produced
     // millions of identical, contextless lines in one incident. Log the
     // full/recovered transitions with identity, count drops in between, and
@@ -1526,7 +1547,7 @@ async fn handle_socket_inner<S, T, E>(
                     msg => {
                         tracing::warn!(
                             doc_id = %doc_id,
-                            user = ?log_user,
+                            user = %log_user,
                             ?msg,
                             "Received non-binary message"
                         );
@@ -1556,7 +1577,7 @@ async fn handle_socket_inner<S, T, E>(
                     Err(e) => {
                         tracing::warn!(
                             doc_id = %doc_id,
-                            user = ?log_user,
+                            user = %log_user,
                             ?e,
                             "Error handling message"
                         );
@@ -1566,8 +1587,11 @@ async fn handle_socket_inner<S, T, E>(
             _ = ticker.tick() => {
                 if last_pong.elapsed() > PONG_TIMEOUT && !pong_timed_out {
                     pong_timed_out = true;
+                    // Nothing acts on this, and the long-lived folder-root
+                    // subscriptions miss pongs routinely. The metric is the
+                    // place to watch it from.
                     metrics.record_pong_timeout();
-                    tracing::info!(
+                    tracing::debug!(
                         doc_id = %doc_id,
                         "Pong timeout (observe-only): a keepalive reaper would close this connection"
                     );
@@ -1591,13 +1615,28 @@ async fn handle_socket_inner<S, T, E>(
         }
     };
 
-    tracing::info!(
-        doc_id = %doc_id,
-        user = ?log_user,
-        close_reason,
-        duration_secs = connected_at.elapsed().as_secs(),
-        "WebSocket disconnected"
-    );
+    // Clients hold one socket per doc and cycle them on a fixed interval - a
+    // vault this size produces over a thousand clean closes an hour, clustered
+    // at the cycle length rather than spread out. None of it is actionable, so
+    // only an abnormal close reason stays at info.
+    let duration_secs = connected_at.elapsed().as_secs();
+    if close_reason == "close_frame" {
+        tracing::debug!(
+            doc_id = %doc_id,
+            user = %log_user,
+            close_reason = %close_reason,
+            duration_secs,
+            "WebSocket disconnected"
+        );
+    } else {
+        tracing::info!(
+            doc_id = %doc_id,
+            user = %log_user,
+            close_reason = %close_reason,
+            duration_secs,
+            "WebSocket disconnected"
+        );
+    }
 
     metrics.record_websocket_close(close_reason);
 
@@ -1887,7 +1926,7 @@ async fn handle_file_upload_url(
     TypedHeader(host): TypedHeader<headers::Host>,
     auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
 ) -> Result<Json<FileUploadUrlResponse>, AppError> {
-    tracing::info!(doc_id = %doc_id, "Generating file upload URL");
+    tracing::debug!(doc_id = %doc_id, "Generating file upload URL");
 
     // Get token and extract metadata
     let token = get_token_from_header(auth_header);
@@ -2011,7 +2050,7 @@ async fn handle_file_download_url(
     Query(params): Query<FileDownloadQueryParams>,
     auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
 ) -> Result<Json<FileDownloadUrlResponse>, AppError> {
-    tracing::info!(doc_id = %doc_id, hash = ?params.hash, "Generating file download URL");
+    tracing::debug!(doc_id = %doc_id, hash = ?params.hash, "Generating file download URL");
 
     // Get token
     let token = get_token_from_header(auth_header);
