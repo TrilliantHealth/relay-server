@@ -1,5 +1,6 @@
 use crate::doc_lifecycle::{AttachGuard, AttachKind, DocRegistry, LifecycleConfig};
 use crate::edit_author;
+use crate::edit_bursts::{self, EditBursts, Verdict};
 use crate::vpath_index::VPathIndex;
 use anyhow::{anyhow, Result};
 use axum::{
@@ -267,6 +268,9 @@ pub struct Server {
     /// Relay user id -> display name, for log readability. Empty unless
     /// configured; a missing id logs `name=<none>`.
     user_names: Arc<HashMap<String, String>>,
+    /// Accrues runs of edits so typing logs one burst rather than one line per
+    /// keystroke. Shared with the sweeper task that emits the summaries.
+    edit_bursts: Arc<EditBursts>,
 }
 
 const DENIAL_LOG_INTERVAL: Duration = Duration::from_secs(300);
@@ -349,6 +353,7 @@ impl Server {
             denial_log_throttle: Mutex::new(HashMap::new()),
             vpath_index: Arc::new(VPathIndex::default()),
             user_names: Arc::new(HashMap::new()),
+            edit_bursts: Arc::new(EditBursts::new()),
         })
     }
 
@@ -366,10 +371,7 @@ impl Server {
         self
     }
 
-    pub fn with_user_names(
-        mut self,
-        names: impl IntoIterator<Item = (String, String)>,
-    ) -> Self {
+    pub fn with_user_names(mut self, names: impl IntoIterator<Item = (String, String)>) -> Self {
         let names: HashMap<String, String> = names.into_iter().collect();
         if !names.is_empty() {
             tracing::info!("Loaded display names for {} user id(s)", names.len());
@@ -642,6 +644,7 @@ impl Server {
             let registry = self.registry.clone();
             let vpath_index = self.vpath_index.clone();
             let user_names = self.user_names.clone();
+            let edit_bursts = self.edit_bursts.clone();
             let doc_id_for_callback = doc_id.to_string();
             // The parent pin lives in this closure, which the doc owns via
             // its SyncKv observer: the guard detaches when the doc drops.
@@ -692,13 +695,9 @@ impl Server {
                     };
 
                     if editing_folder_doc {
-                        if let Some(delta) = event
-                            .state
-                            .as_deref()
-                            .and_then(|state| {
-                                vpath_index.sync_membership_from_snapshot(channel, state)
-                            })
-                        {
+                        if let Some(delta) = event.state.as_deref().and_then(|state| {
+                            vpath_index.sync_membership_from_snapshot(channel, state)
+                        }) {
                             // Same resolution as "Doc edited": event.user is the
                             // folder doc's first-load identity, not whoever made
                             // this change.
@@ -763,19 +762,33 @@ impl Server {
                     // Field order is for a human reading a terminal: the two
                     // ids are 73 characters each and would push everything
                     // legible off the right edge.
+                    //
+                    // One update is one keystroke, so only the first edit of a
+                    // run is logged here; the rest accrue and the sweeper
+                    // reports the burst's totals once typing stops.
                     let user_id = author.as_deref().or(event.user.as_deref());
-                    tracing::info!(
-                        vpath = %vpath.as_deref().unwrap_or("-"),
-                        name = %user_id
-                            .and_then(|id| user_names.get(id))
-                            .map(String::as_str)
-                            .unwrap_or("<none>"),
-                        user = %user_id.unwrap_or("-"),
-                        update_bytes = event.update.as_ref().map_or(0, Vec::len),
-                        doc_id = %edited_doc_id,
-                        channel = %channel,
-                        "Doc edited"
-                    );
+                    let update_bytes = event.update.as_ref().map_or(0, Vec::len);
+                    let vpath = vpath.as_deref().unwrap_or("-");
+                    if let Verdict::Leading = edit_bursts.record(
+                        edited_doc_id,
+                        user_id.unwrap_or("-"),
+                        vpath,
+                        channel,
+                        update_bytes,
+                    ) {
+                        tracing::info!(
+                            vpath = %vpath,
+                            name = %user_id
+                                .and_then(|id| user_names.get(id))
+                                .map(String::as_str)
+                                .unwrap_or("<none>"),
+                            user = %user_id.unwrap_or("-"),
+                            update_bytes,
+                            doc_id = %edited_doc_id,
+                            channel = %channel,
+                            "Doc edited"
+                        );
+                    }
 
                     // Step 1: Create the envelope with predetermined routing channel
                     let envelope = EventEnvelope::new(routing_channel_for_callback.clone(), event);
@@ -1122,6 +1135,44 @@ impl Server {
             app.layer(middleware::from_fn(Self::redact_error_middleware))
         };
 
+        let bursts = self.edit_bursts.clone();
+        let burst_token = self.cancellation_token.clone();
+        let burst_user_names = self.user_names.clone();
+        let log_edit_bursts = move |finished: Vec<edit_bursts::FinishedBurst>| {
+            for burst in finished {
+                tracing::info!(
+                    vpath = %burst.vpath,
+                    name = %burst_user_names
+                        .get(&burst.user)
+                        .map(String::as_str)
+                        .unwrap_or("<none>"),
+                    user = %burst.user,
+                    edits = burst.edits,
+                    update_bytes = burst.bytes,
+                    span_ms = burst.span.as_millis(),
+                    doc_id = %burst.doc_id,
+                    channel = %burst.channel,
+                    "Doc edit burst"
+                );
+            }
+        };
+        tokio::spawn(async move {
+            // Sweeps more often than the quiet window so a finished burst is
+            // reported near the moment it ends rather than up to a window late.
+            let mut ticker = tokio::time::interval(edit_bursts::BURST_QUIET / 4);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => log_edit_bursts(bursts.take_finished()),
+                    _ = burst_token.cancelled() => {
+                        // Bursts still in flight would otherwise go unreported,
+                        // losing the edits made just before a restart.
+                        log_edit_bursts(bursts.drain_all());
+                        break;
+                    }
+                }
+            }
+        });
+
         tracing::info!("Starting HTTP server...");
         axum::serve(listener, app.into_make_service())
             .with_graceful_shutdown(async move {
@@ -1352,9 +1403,10 @@ async fn handle_socket_upgrade_with_channel_and_user(
     // loaded and pinned the parent folder by now, and a doc does not change
     // path mid-socket often enough to justify re-resolving on every update.
     let vpath = channel_for_vpath.as_deref().and_then(|channel| {
-        server_state.registry.peek(channel).and_then(|folder| {
-            server_state.vpath_index.resolve(channel, &folder, &doc_id)
-        })
+        server_state
+            .registry
+            .peek(channel)
+            .and_then(|folder| server_state.vpath_index.resolve(channel, &folder, &doc_id))
     });
     let user_name = user_for_pud
         .as_deref()
