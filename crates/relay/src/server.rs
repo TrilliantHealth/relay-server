@@ -1,3 +1,4 @@
+use crate::client_versions::{self, ClientVersions};
 use crate::doc_lifecycle::{AttachGuard, AttachKind, DocRegistry, LifecycleConfig};
 use crate::edit_author;
 use crate::edit_bursts::{self, EditBursts, Verdict};
@@ -271,7 +272,16 @@ pub struct Server {
     /// Accrues runs of edits so typing logs one burst rather than one line per
     /// keystroke. Shared with the sweeper task that emits the summaries.
     edit_bursts: Arc<EditBursts>,
+    /// Plugin version per Yjs client id, so edit lines can name the build that
+    /// made the edit without a log line per per-doc socket.
+    client_versions: Arc<ClientVersions>,
 }
+
+/// Feeds awareness entries into the client-version table: (client id,
+/// declared version from the entry's payload, solo-live). The trust rules
+/// live in `client_versions.rs`; this closure carries the connection's own
+/// reported version so first introductions can be inferred from it.
+type ClientVersionRecorder = Arc<dyn Fn(u64, Option<&str>, bool) + Send + Sync>;
 
 const DENIAL_LOG_INTERVAL: Duration = Duration::from_secs(300);
 
@@ -354,6 +364,7 @@ impl Server {
             vpath_index: Arc::new(VPathIndex::default()),
             user_names: Arc::new(HashMap::new()),
             edit_bursts: Arc::new(EditBursts::new()),
+            client_versions: Arc::new(ClientVersions::new()),
         })
     }
 
@@ -441,6 +452,11 @@ impl Server {
             _ => {
                 if let Some(suppressed) = self.denial_log_permit(user) {
                     tracing::warn!(
+                        name = %self
+                            .user_names
+                            .get(user)
+                            .map(String::as_str)
+                            .unwrap_or("<none>"),
                         user = %user,
                         // Old builds report nothing at all, and "which of these
                         // is version-less" drives who needs a manual upgrade.
@@ -645,6 +661,7 @@ impl Server {
             let vpath_index = self.vpath_index.clone();
             let user_names = self.user_names.clone();
             let edit_bursts = self.edit_bursts.clone();
+            let client_versions = self.client_versions.clone();
             let doc_id_for_callback = doc_id.to_string();
             // The parent pin lives in this closure, which the doc owns via
             // its SyncKv observer: the guard detaches when the doc drops.
@@ -769,13 +786,21 @@ impl Server {
                     let user_id = author.as_deref().or(event.user.as_deref());
                     let update_bytes = event.update.as_ref().map_or(0, Vec::len);
                     let vpath = vpath.as_deref().unwrap_or("-");
-                    if let Verdict::Leading = edit_bursts.record(
-                        edited_doc_id,
-                        user_id.unwrap_or("-"),
+                    // The client ids in the update are what a version is keyed
+                    // on: one per device and session, unlike the user.
+                    let edit_clients = event
+                        .update
+                        .as_deref()
+                        .map(edit_author::clients_in_update)
+                        .unwrap_or_default();
+                    if let Verdict::Leading = edit_bursts.record(edit_bursts::Edit {
+                        doc_id: edited_doc_id,
+                        user: user_id.unwrap_or("-"),
                         vpath,
                         channel,
-                        update_bytes,
-                    ) {
+                        clients: &edit_clients,
+                        bytes: update_bytes,
+                    }) {
                         tracing::info!(
                             vpath = %vpath,
                             name = %user_id
@@ -783,6 +808,18 @@ impl Server {
                                 .map(String::as_str)
                                 .unwrap_or("<none>"),
                             user = %user_id.unwrap_or("-"),
+                            // Keyed on the update's own client ids, not the
+                            // connection: the callback is built once per doc
+                            // load and outlives the socket that created it.
+                            version = %client_versions.describe(&edit_clients),
+                            // The ids a version report would key on; kept on
+                            // the line so an unversioned edit can be traced to
+                            // whether its client ever reached the recorder.
+                            clients = %edit_clients
+                                .iter()
+                                .map(u64::to_string)
+                                .collect::<Vec<_>>()
+                                .join(","),
                             update_bytes,
                             doc_id = %edited_doc_id,
                             channel = %channel,
@@ -1065,6 +1102,7 @@ impl Server {
         let mut router = Router::new()
             .route("/ready", get(ready))
             .route("/check_store", post(check_store))
+            .route("/client-versions", get(get_client_versions))
             .route("/check_store", get(check_store_deprecated))
             .route("/doc/ws/:doc_id", get(handle_socket_upgrade_deprecated))
             .route("/doc/new", post(new_doc))
@@ -1138,6 +1176,7 @@ impl Server {
         let bursts = self.edit_bursts.clone();
         let burst_token = self.cancellation_token.clone();
         let burst_user_names = self.user_names.clone();
+        let burst_client_versions = self.client_versions.clone();
         let log_edit_bursts = move |finished: Vec<edit_bursts::FinishedBurst>| {
             for burst in finished {
                 tracing::info!(
@@ -1147,6 +1186,13 @@ impl Server {
                         .map(String::as_str)
                         .unwrap_or("<none>"),
                     user = %burst.user,
+                    version = %burst_client_versions.describe(&burst.clients),
+                    clients = %burst
+                        .clients
+                        .iter()
+                        .map(u64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(","),
                     edits = burst.edits,
                     update_bytes = burst.bytes,
                     span_ms = burst.span.as_millis(),
@@ -1365,6 +1411,7 @@ async fn update_doc_inner(
     Ok(StatusCode::OK.into_response())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_socket_upgrade_with_channel_and_user(
     ws: WebSocketUpgrade,
     Path(doc_id): Path<String>,
@@ -1372,6 +1419,7 @@ async fn handle_socket_upgrade_with_channel_and_user(
     routing_channel: Option<String>,
     user: Option<String>,
     token: Option<String>,
+    version: Option<String>,
     State(server_state): State<Arc<Server>>,
 ) -> Result<Response, AppError> {
     server_state
@@ -1418,6 +1466,31 @@ async fn handle_socket_upgrade_with_channel_and_user(
     let sync_protocol_event_sender = server_state.sync_protocol_event_sender.clone();
     let metrics = server_state.metrics.clone();
     let doc_id_clone = doc_id.clone();
+    // Captures this connection's reported version; the client ids it will be
+    // filed under are not known until updates arrive.
+    let client_versions = server_state.client_versions.clone();
+    let doc_id_for_recorder = doc_id.clone();
+    let record_client_version: ClientVersionRecorder =
+        Arc::new(move |client_id, declared: Option<&str>, solo_live| {
+            // One line per binding that changed the table - first sightings
+            // and genuine declared-version changes - so an unversioned edit
+            // can be traced to whether its client id was ever bound.
+            let recorded = client_versions.observe(client_versions::Observation {
+                client_id,
+                declared,
+                solo_live,
+                connection_version: version.as_deref(),
+            });
+            if let Some(recorded) = recorded {
+                tracing::info!(
+                    client_id,
+                    version = %recorded.version,
+                    previous = %recorded.previous.as_deref().unwrap_or("-"),
+                    doc_id = %doc_id_for_recorder,
+                    "Recorded client version"
+                );
+            }
+        });
 
     // The guard moves into the upgrade closure: an abandoned upgrade
     // detaches via RAII.
@@ -1434,6 +1507,7 @@ async fn handle_socket_upgrade_with_channel_and_user(
             vpath,
             user_name,
             metrics,
+            record_client_version,
         )
     }))
 }
@@ -1518,6 +1592,7 @@ async fn handle_socket_upgrade_deprecated(
         channel,
         user,
         params.token.clone(), // Pass the token from query params
+        params.v.clone(),
         State(server_state),
     )
     .await
@@ -1550,11 +1625,13 @@ async fn handle_socket_upgrade_full_path(
         channel,
         user,
         params.token.clone(), // Pass the token from query params
+        params.v.clone(),
         State(server_state),
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_socket(
     socket: WebSocket,
     guard: AttachGuard,
@@ -1567,6 +1644,7 @@ async fn handle_socket(
     vpath: Option<String>,
     user_name: Option<String>,
     metrics: Arc<RelayMetrics>,
+    record_client_version: ClientVersionRecorder,
 ) {
     let (sink, stream) = socket.split();
     handle_socket_inner(
@@ -1582,6 +1660,7 @@ async fn handle_socket(
         vpath,
         user_name,
         metrics,
+        record_client_version,
     )
     .await
 }
@@ -1602,6 +1681,7 @@ async fn handle_socket_inner<S, T, E>(
     vpath: Option<String>,
     user_name: Option<String>,
     metrics: Arc<RelayMetrics>,
+    record_client_version: ClientVersionRecorder,
 ) where
     S: Sink<Message> + Send + Unpin + 'static,
     T: Stream<Item = Result<Message, E>> + Unpin,
@@ -1707,6 +1787,9 @@ async fn handle_socket_inner<S, T, E>(
             }
         },
     );
+    conn.set_on_client_version(Box::new(move |client_id, declared, solo_live| {
+        record_client_version(client_id, declared, solo_live)
+    }));
     conn.set_sync_kv(sync_kv);
     conn.set_doc_id(doc_id.clone());
     if let Some(vpath) = vpath {
@@ -1874,6 +1957,25 @@ async fn handle_socket_inner<S, T, E>(
     // was still holding — before the machine's park window can open.
     drop(connection);
     drop(guard);
+}
+
+/// The live client-id -> plugin-version table, fed by `relayVersion`
+/// declarations in awareness payloads. Empty entries simply have not
+/// declared; see client_versions.rs for why nothing else may feed this.
+async fn get_client_versions(
+    auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
+    State(server_state): State<Arc<Server>>,
+) -> Result<Json<Value>, AppError> {
+    server_state.check_auth(auth_header)?;
+
+    let entries = server_state.client_versions.snapshot();
+    Ok(Json(json!({
+        "count": entries.len(),
+        "client_versions": entries
+            .into_iter()
+            .map(|(client_id, version)| (client_id.to_string(), Value::String(version)))
+            .collect::<serde_json::Map<String, Value>>(),
+    })))
 }
 
 async fn check_store(
@@ -3298,6 +3400,58 @@ mod test {
     }
 
     #[tokio::test]
+    async fn client_versions_bind_by_first_introduction() {
+        let server_state = Arc::new(
+            Server::new(
+                None,
+                Duration::from_secs(60),
+                None,
+                None,
+                vec![],
+                CancellationToken::new(),
+                true,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+
+        // A declared payload binds bare; a first solo introduction binds
+        // inferred (~); an echo of an already-seen id binds nothing.
+        server_state
+            .client_versions
+            .observe(client_versions::Observation {
+                client_id: 1,
+                declared: Some("0.8.9-th.2"),
+                solo_live: true,
+                connection_version: None,
+            });
+        server_state
+            .client_versions
+            .observe(client_versions::Observation {
+                client_id: 2,
+                declared: None,
+                solo_live: true,
+                connection_version: Some("0.8.9-th.1"),
+            });
+        server_state
+            .client_versions
+            .observe(client_versions::Observation {
+                client_id: 2,
+                declared: None,
+                solo_live: true,
+                connection_version: Some("0.8.8-th.10"),
+            });
+
+        assert_eq!(server_state.client_versions.describe(&[1]), "0.8.9-th.2");
+        assert_eq!(server_state.client_versions.describe(&[2]), "~0.8.9-th.1");
+        assert_eq!(
+            server_state.client_versions.describe(&[9]),
+            crate::client_versions::UNKNOWN
+        );
+    }
+
+    #[tokio::test]
     async fn test_denial_log_throttle() {
         let server_state = Server::new(
             None,
@@ -4375,6 +4529,7 @@ mod test {
                 None,
                 None,
                 metrics.clone(),
+                Arc::new(|_client_id, _declared, _solo| {}),
             ));
 
             SocketHarness {

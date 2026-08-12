@@ -34,6 +34,9 @@ type Callback = Arc<dyn Fn(&[u8]) + 'static>;
 #[cfg(feature = "sync")]
 type Callback = Arc<dyn Fn(&[u8]) + 'static + Send + Sync>;
 
+/// (client id, declared version from the awareness payload, solo-live).
+type ClientVersionCallback = Box<dyn Fn(u64, Option<&str>, bool) + Send + Sync>;
+
 const SYNC_STATUS_MESSAGE: u8 = 102;
 
 /// An incoming update that grows the doc's delete set by at least this many
@@ -90,6 +93,14 @@ pub struct DocConnection {
     /// by the caller, which owns the folder index; a GUID alone does not tell an
     /// operator which note a deletion hit.
     vpath: Option<String>,
+
+    /// Called for every awareness entry with (client id, declared version
+    /// from the state payload if any, solo-live). Solo-live - a non-null
+    /// entry arriving alone - is the shape of a client broadcasting its own
+    /// state, which the caller may use for first-introduction inference;
+    /// entries inside full-map relays and leave (null) entries are marked
+    /// but never trusted, since both can describe other connections' clients.
+    on_client_version: Option<ClientVersionCallback>,
 
     /// Display name for `user`, for log context only. The caller owns the
     /// id -> name map; None logs `<none>`.
@@ -237,6 +248,7 @@ impl DocConnection {
             authorization,
             callback,
             client_id: OnceLock::new(),
+            on_client_version: None,
             closed,
             event_subscriptions: Arc::new(RwLock::new(HashSet::new())),
             expiration_time,
@@ -264,6 +276,10 @@ impl DocConnection {
 
     pub fn set_vpath(&mut self, vpath: String) {
         self.vpath = Some(vpath);
+    }
+
+    pub fn set_on_client_version(&mut self, callback: ClientVersionCallback) {
+        self.on_client_version = Some(callback);
     }
 
     pub fn set_user_name(&mut self, user_name: String) {
@@ -321,11 +337,6 @@ impl DocConnection {
         awareness: &Awareness,
         sv_before: &std::collections::HashSet<ClientID>,
     ) {
-        let user_id = match &self.user {
-            Some(u) => u,
-            None => return,
-        };
-
         let sv_after = awareness.doc().transact().state_vector();
 
         let new_ids: Vec<ClientID> = sv_after
@@ -342,6 +353,10 @@ impl DocConnection {
         if new_ids.is_empty() {
             return;
         }
+
+        let Some(user_id) = &self.user else {
+            return;
+        };
 
         let doc = awareness.doc();
 
@@ -502,6 +517,22 @@ impl DocConnection {
                 protocol.handle_awareness_query(&awareness)
             }
             Message::Awareness(update) => {
+                if let Some(callback) = &self.on_client_version {
+                    let solo = update.clients.len() == 1;
+                    for (client_id, entry) in update.clients.iter() {
+                        // A declared version is read from any delivery - the
+                        // payload is minted by the entry's owner. All other
+                        // trust decisions belong to the caller, informed by
+                        // whether this entry could be a self-broadcast.
+                        let live = entry.json.trim() != "null";
+                        let state = serde_json::from_str::<serde_json::Value>(&entry.json).ok();
+                        let declared = state
+                            .as_ref()
+                            .and_then(|s| s.get("relayVersion"))
+                            .and_then(|v| v.as_str());
+                        callback(client_id.get(), declared, solo && live);
+                    }
+                }
                 if update.clients.len() == 1 {
                     let client_id = update.clients.keys().next().unwrap();
                     self.client_id.get_or_init(|| *client_id);
@@ -868,6 +899,177 @@ mod tests {
         assert_eq!(
             deleted_spans_by_client(&doc.transact()).get(&client),
             Some(&300)
+        );
+    }
+
+    #[test]
+    fn updates_record_nobody_no_matter_their_shape() {
+        use std::sync::Mutex;
+        use yrs::{Map, Transact};
+
+        // Sync updates relay other clients' ops, so none of them - solo
+        // insert, delete-only, relayed diff - may bind this connection's
+        // version to the ids they carry. The deliverer is not the minter.
+        let doc = yrs::Doc::new();
+        let map = doc.get_or_insert_map("data");
+        {
+            let mut txn = doc.transact_mut();
+            map.insert(&mut txn, "k", "v");
+        }
+        let solo_insert = doc
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        let sv_after_insert = doc.transact().state_vector();
+        {
+            let mut txn = doc.transact_mut();
+            map.remove(&mut txn, "k");
+        }
+        let delete_only = doc.transact().encode_state_as_update_v1(&sv_after_insert);
+
+        let awareness = Arc::new(RwLock::new(Awareness::new(yrs::Doc::new())));
+        let mut connection = DocConnection::new(awareness, Authorization::Full, |_| {});
+        let seen: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        connection.set_on_client_version(Box::new(move |id, _declared, _solo| {
+            recorder.lock().unwrap().push(id);
+        }));
+
+        connection
+            .handle_msg(
+                &DefaultProtocol,
+                Message::Sync(SyncMessage::Update(solo_insert)),
+            )
+            .unwrap();
+        connection
+            .handle_msg(
+                &DefaultProtocol,
+                Message::Sync(SyncMessage::Update(delete_only)),
+            )
+            .unwrap();
+
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "updates must never bind the connection version to their ids: got {:?}",
+            *seen.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_version_declared_in_the_awareness_payload_is_recorded() {
+        use std::sync::Mutex;
+
+        // The version lives inside the client's own awareness state, so it
+        // stays bound to the minting client even when another client relays
+        // the entry.
+        let client_doc = yrs::Doc::new();
+        let client_id = client_doc.client_id().get();
+        let mut client_awareness = Awareness::new(client_doc);
+        client_awareness.set_local_state(r#"{"relayVersion":"0.8.9-th.2"}"#);
+        let declared = client_awareness.update().unwrap();
+
+        let awareness = Arc::new(RwLock::new(Awareness::new(yrs::Doc::new())));
+        let mut connection = DocConnection::new(awareness, Authorization::Full, |_| {});
+        let seen: Arc<Mutex<Vec<(u64, Option<String>, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        connection.set_on_client_version(Box::new(move |id, declared, solo| {
+            recorder
+                .lock()
+                .unwrap()
+                .push((id, declared.map(str::to_string), solo));
+        }));
+
+        connection
+            .handle_msg(&DefaultProtocol, Message::Awareness(declared))
+            .unwrap();
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(client_id, Some("0.8.9-th.2".to_string()), true)]
+        );
+    }
+
+    #[test]
+    fn awareness_without_a_version_field_still_reports_the_entry() {
+        use std::sync::Mutex;
+
+        // Pre-payload plugins declare only user/cursor fields. The entry is
+        // still surfaced (declared=None, solo-live) so the caller can apply
+        // first-introduction inference from the connection's version.
+        let client_doc = yrs::Doc::new();
+        let client_id = client_doc.client_id().get();
+        let mut client_awareness = Awareness::new(client_doc);
+        client_awareness.set_local_state(r#"{"user":{"name":"x"}}"#);
+        let declared = client_awareness.update().unwrap();
+
+        let awareness = Arc::new(RwLock::new(Awareness::new(yrs::Doc::new())));
+        let mut connection = DocConnection::new(awareness, Authorization::Full, |_| {});
+        let seen: Arc<Mutex<Vec<(u64, Option<String>, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        connection.set_on_client_version(Box::new(move |id, declared, solo| {
+            recorder
+                .lock()
+                .unwrap()
+                .push((id, declared.map(str::to_string), solo));
+        }));
+
+        connection
+            .handle_msg(&DefaultProtocol, Message::Awareness(declared))
+            .unwrap();
+
+        assert_eq!(*seen.lock().unwrap(), vec![(client_id, None, true)]);
+    }
+
+    #[test]
+    fn a_multi_client_diff_records_nobody() {
+        use std::sync::Mutex;
+        use yrs::{Map, Transact};
+
+        // A bulk sync diff carries several clients' blocks; stamping this
+        // connection's version onto all of them re-labeled the whole roster
+        // after every server restart.
+        let a = yrs::Doc::new();
+        {
+            let map = a.get_or_insert_map("data");
+            let mut txn = a.transact_mut();
+            map.insert(&mut txn, "a", "1");
+        }
+        let b = yrs::Doc::with_client_id(a.client_id().get() + 1);
+        {
+            let mut txn = b.transact_mut();
+            txn.apply_update(
+                yrs::Update::decode_v1(
+                    &a.transact()
+                        .encode_state_as_update_v1(&yrs::StateVector::default()),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        {
+            let map = b.get_or_insert_map("data");
+            let mut txn = b.transact_mut();
+            map.insert(&mut txn, "b", "2");
+        }
+        let merged = b
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+
+        let awareness = Arc::new(RwLock::new(Awareness::new(yrs::Doc::new())));
+        let mut connection = DocConnection::new(awareness, Authorization::Full, |_| {});
+        let seen: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        connection.set_on_client_version(Box::new(move |id, _declared, _solo| {
+            recorder.lock().unwrap().push(id);
+        }));
+
+        connection
+            .handle_msg(&DefaultProtocol, Message::Sync(SyncMessage::Update(merged)))
+            .unwrap();
+
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "multi-client diffs must not stamp anyone: got {:?}",
+            *seen.lock().unwrap()
         );
     }
 

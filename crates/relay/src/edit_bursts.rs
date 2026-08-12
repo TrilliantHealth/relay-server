@@ -13,7 +13,7 @@
 //! Bursts are keyed by doc *and* user: two people in one file are two bursts,
 //! so neither line attributes the other's typing.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -36,6 +36,10 @@ struct _Burst {
     vpath: String,
     /// The shared folder the doc belongs to; a doc id alone does not say which.
     channel: String,
+    /// Every Yjs client id seen in the burst, so the summary can name the
+    /// build(s) that produced it. A burst is one user, but a user may edit from
+    /// more than one device.
+    clients: BTreeSet<u64>,
     /// Edits after the leading one, which is logged rather than accrued.
     suppressed: u64,
     /// Bytes across the whole burst, leading edit included.
@@ -50,6 +54,7 @@ pub struct FinishedBurst {
     pub user: String,
     pub vpath: String,
     pub channel: String,
+    pub clients: Vec<u64>,
     /// Total edits in the burst, including the one already logged.
     pub edits: u64,
     pub bytes: usize,
@@ -64,6 +69,19 @@ pub enum Verdict {
     Suppressed,
 }
 
+/// One recorded edit. A struct rather than positional arguments because four
+/// of these fields are strings that would silently transpose.
+pub struct Edit<'a> {
+    pub doc_id: &'a str,
+    pub user: &'a str,
+    /// Stored for the eventual flush, so passing the resolved path (not "-")
+    /// whenever it is known keeps the summary line useful.
+    pub vpath: &'a str,
+    pub channel: &'a str,
+    pub clients: &'a [u64],
+    pub bytes: usize,
+}
+
 #[derive(Default)]
 pub struct EditBursts {
     bursts: Mutex<HashMap<_BurstKey, _Burst>>,
@@ -75,32 +93,22 @@ impl EditBursts {
     }
 
     /// Records an edit, reporting whether the caller should log it.
-    ///
-    /// `vpath` is stored for the eventual flush, so passing the resolved path
-    /// (not "-") whenever it is known keeps the summary line useful.
-    pub fn record(
-        &self,
-        doc_id: &str,
-        user: &str,
-        vpath: &str,
-        channel: &str,
-        bytes: usize,
-    ) -> Verdict {
-        self.record_at(doc_id, user, vpath, channel, bytes, Instant::now())
+    pub fn record(&self, edit: Edit) -> Verdict {
+        self.record_at(edit, Instant::now())
     }
 
     /// `now` is a parameter so a caller can replay a recorded cadence against
     /// the same clock the sweep reads; reading it internally would leave the
     /// two disagreeing and flush bursts mid-run.
-    fn record_at(
-        &self,
-        doc_id: &str,
-        user: &str,
-        vpath: &str,
-        channel: &str,
-        bytes: usize,
-        now: Instant,
-    ) -> Verdict {
+    fn record_at(&self, edit: Edit, now: Instant) -> Verdict {
+        let Edit {
+            doc_id,
+            user,
+            vpath,
+            channel,
+            clients,
+            bytes,
+        } = edit;
         let mut bursts = self.bursts.lock().unwrap();
         let key = _BurstKey {
             doc_id: doc_id.to_string(),
@@ -111,6 +119,7 @@ impl EditBursts {
                 burst.suppressed += 1;
                 burst.bytes += bytes;
                 burst.last_edit = now;
+                burst.clients.extend(clients);
                 if !vpath.is_empty() && vpath != "-" {
                     burst.vpath = vpath.to_string();
                 }
@@ -122,6 +131,7 @@ impl EditBursts {
                     _Burst {
                         vpath: vpath.to_string(),
                         channel: channel.to_string(),
+                        clients: clients.iter().copied().collect(),
                         suppressed: 0,
                         bytes,
                         started: now,
@@ -163,6 +173,7 @@ impl EditBursts {
                     user: key.user,
                     vpath: burst.vpath,
                     channel: burst.channel,
+                    clients: burst.clients.into_iter().collect(),
                     edits: burst.suppressed + 1,
                     bytes: burst.bytes,
                     span: burst.last_edit.saturating_duration_since(burst.started),
@@ -185,6 +196,7 @@ impl EditBursts {
                 user: key.user,
                 vpath: burst.vpath,
                 channel: burst.channel,
+                clients: burst.clients.into_iter().collect(),
                 edits: burst.suppressed + 1,
                 bytes: burst.bytes,
                 span: burst.last_edit.saturating_duration_since(burst.started),
@@ -204,23 +216,59 @@ mod tests {
     #[test]
     fn the_first_edit_logs_and_the_rest_do_not() {
         let bursts = EditBursts::new();
-        assert!(is_leading(
-            bursts.record("doc", "alan", "/a.md", "folder", 26)
-        ));
-        assert!(!is_leading(
-            bursts.record("doc", "alan", "/a.md", "folder", 26)
-        ));
-        assert!(!is_leading(
-            bursts.record("doc", "alan", "/a.md", "folder", 26)
-        ));
+        assert!(is_leading(bursts.record(Edit {
+            doc_id: "doc",
+            user: "alan",
+            vpath: "/a.md",
+            channel: "folder",
+            clients: &[1],
+            bytes: 26,
+        })));
+        assert!(!is_leading(bursts.record(Edit {
+            doc_id: "doc",
+            user: "alan",
+            vpath: "/a.md",
+            channel: "folder",
+            clients: &[1],
+            bytes: 26,
+        })));
+        assert!(!is_leading(bursts.record(Edit {
+            doc_id: "doc",
+            user: "alan",
+            vpath: "/a.md",
+            channel: "folder",
+            clients: &[1],
+            bytes: 26,
+        })));
     }
 
     #[test]
     fn a_quiet_burst_reports_totals_including_the_leading_edit() {
         let bursts = EditBursts::new();
-        bursts.record("doc", "alan", "/a.md", "folder", 26);
-        bursts.record("doc", "alan", "/a.md", "folder", 11);
-        bursts.record("doc", "alan", "/a.md", "folder", 3);
+        bursts.record(Edit {
+            doc_id: "doc",
+            user: "alan",
+            vpath: "/a.md",
+            channel: "folder",
+            clients: &[1],
+            bytes: 26,
+        });
+        bursts.record(Edit {
+            doc_id: "doc",
+            user: "alan",
+            vpath: "/a.md",
+            channel: "folder",
+            clients: &[1],
+            bytes: 11,
+        });
+        bursts.record(Edit {
+            doc_id: "doc",
+            user: "alan",
+            vpath: "/a.md",
+            channel: "folder",
+            clients: &[1],
+            bytes: 3,
+        });
 
         let finished = bursts.take_finished_as_of(Instant::now() + BURST_QUIET);
         assert_eq!(finished.len(), 1);
@@ -232,8 +280,22 @@ mod tests {
     #[test]
     fn a_burst_still_being_typed_is_not_flushed() {
         let bursts = EditBursts::new();
-        bursts.record("doc", "alan", "/a.md", "folder", 26);
-        bursts.record("doc", "alan", "/a.md", "folder", 26);
+        bursts.record(Edit {
+            doc_id: "doc",
+            user: "alan",
+            vpath: "/a.md",
+            channel: "folder",
+            clients: &[1],
+            bytes: 26,
+        });
+        bursts.record(Edit {
+            doc_id: "doc",
+            user: "alan",
+            vpath: "/a.md",
+            channel: "folder",
+            clients: &[1],
+            bytes: 26,
+        });
 
         assert!(bursts.take_finished().is_empty());
     }
@@ -241,7 +303,14 @@ mod tests {
     #[test]
     fn a_lone_edit_is_dropped_rather_than_summarized() {
         let bursts = EditBursts::new();
-        bursts.record("doc", "alan", "/a.md", "folder", 26);
+        bursts.record(Edit {
+            doc_id: "doc",
+            user: "alan",
+            vpath: "/a.md",
+            channel: "folder",
+            clients: &[1],
+            bytes: 26,
+        });
 
         assert!(bursts
             .take_finished_as_of(Instant::now() + BURST_QUIET)
@@ -251,14 +320,38 @@ mod tests {
     #[test]
     fn two_users_in_one_doc_are_separate_bursts() {
         let bursts = EditBursts::new();
-        assert!(is_leading(
-            bursts.record("doc", "alan", "/a.md", "folder", 26)
-        ));
-        assert!(is_leading(
-            bursts.record("doc", "heather", "/a.md", "folder", 26)
-        ));
-        bursts.record("doc", "alan", "/a.md", "folder", 26);
-        bursts.record("doc", "heather", "/a.md", "folder", 26);
+        assert!(is_leading(bursts.record(Edit {
+            doc_id: "doc",
+            user: "alan",
+            vpath: "/a.md",
+            channel: "folder",
+            clients: &[1],
+            bytes: 26,
+        })));
+        assert!(is_leading(bursts.record(Edit {
+            doc_id: "doc",
+            user: "heather",
+            vpath: "/a.md",
+            channel: "folder",
+            clients: &[1],
+            bytes: 26,
+        })));
+        bursts.record(Edit {
+            doc_id: "doc",
+            user: "alan",
+            vpath: "/a.md",
+            channel: "folder",
+            clients: &[1],
+            bytes: 26,
+        });
+        bursts.record(Edit {
+            doc_id: "doc",
+            user: "heather",
+            vpath: "/a.md",
+            channel: "folder",
+            clients: &[1],
+            bytes: 26,
+        });
 
         let mut finished = bursts.take_finished_as_of(Instant::now() + BURST_QUIET);
         finished.sort_by(|a, b| a.user.cmp(&b.user));
@@ -270,8 +363,22 @@ mod tests {
     #[test]
     fn a_later_edit_starts_a_new_burst_that_logs_again() {
         let bursts = EditBursts::new();
-        bursts.record("doc", "alan", "/a.md", "folder", 26);
-        bursts.record("doc", "alan", "/a.md", "folder", 26);
+        bursts.record(Edit {
+            doc_id: "doc",
+            user: "alan",
+            vpath: "/a.md",
+            channel: "folder",
+            clients: &[1],
+            bytes: 26,
+        });
+        bursts.record(Edit {
+            doc_id: "doc",
+            user: "alan",
+            vpath: "/a.md",
+            channel: "folder",
+            clients: &[1],
+            bytes: 26,
+        });
         assert_eq!(
             bursts
                 .take_finished_as_of(Instant::now() + BURST_QUIET)
@@ -279,16 +386,35 @@ mod tests {
             1
         );
 
-        assert!(is_leading(
-            bursts.record("doc", "alan", "/a.md", "folder", 26)
-        ));
+        assert!(is_leading(bursts.record(Edit {
+            doc_id: "doc",
+            user: "alan",
+            vpath: "/a.md",
+            channel: "folder",
+            clients: &[1],
+            bytes: 26,
+        })));
     }
 
     #[test]
     fn a_rename_mid_burst_reports_the_latest_vpath() {
         let bursts = EditBursts::new();
-        bursts.record("doc", "alan", "/before.md", "folder", 26);
-        bursts.record("doc", "alan", "/after.md", "folder", 26);
+        bursts.record(Edit {
+            doc_id: "doc",
+            user: "alan",
+            vpath: "/before.md",
+            channel: "folder",
+            clients: &[1],
+            bytes: 26,
+        });
+        bursts.record(Edit {
+            doc_id: "doc",
+            user: "alan",
+            vpath: "/after.md",
+            channel: "folder",
+            clients: &[1],
+            bytes: 26,
+        });
 
         let finished = bursts.take_finished_as_of(Instant::now() + BURST_QUIET);
         assert_eq!(finished[0].vpath, "/after.md");
@@ -297,8 +423,22 @@ mod tests {
     #[test]
     fn an_unresolved_vpath_does_not_overwrite_a_known_one() {
         let bursts = EditBursts::new();
-        bursts.record("doc", "alan", "/a.md", "folder", 26);
-        bursts.record("doc", "alan", "-", "folder", 26);
+        bursts.record(Edit {
+            doc_id: "doc",
+            user: "alan",
+            vpath: "/a.md",
+            channel: "folder",
+            clients: &[1],
+            bytes: 26,
+        });
+        bursts.record(Edit {
+            doc_id: "doc",
+            user: "alan",
+            vpath: "-",
+            channel: "folder",
+            clients: &[1],
+            bytes: 26,
+        });
 
         let finished = bursts.take_finished_as_of(Instant::now() + BURST_QUIET);
         assert_eq!(finished[0].vpath, "/a.md");
@@ -318,14 +458,34 @@ mod tests {
         let bursts = EditBursts::new();
         let mut at = Instant::now();
         let mut leading = 0;
-        if is_leading(bursts.record_at("doc", "alan", "/a.md", "folder", 26, at)) {
+        if is_leading(bursts.record_at(
+            Edit {
+                doc_id: "doc",
+                user: "alan",
+                vpath: "/a.md",
+                channel: "folder",
+                clients: &[1],
+                bytes: 26,
+            },
+            at,
+        )) {
             leading += 1;
         }
         for gap in gaps_ms {
             at += Duration::from_millis(gap);
             // A sweep runs between edits; none should fire mid-burst.
             assert!(bursts.take_finished_as_of(at).is_empty());
-            if is_leading(bursts.record_at("doc", "alan", "/a.md", "folder", 26, at)) {
+            if is_leading(bursts.record_at(
+                Edit {
+                    doc_id: "doc",
+                    user: "alan",
+                    vpath: "/a.md",
+                    channel: "folder",
+                    clients: &[1],
+                    bytes: 26,
+                },
+                at,
+            )) {
                 leading += 1;
             }
         }
@@ -339,8 +499,22 @@ mod tests {
     #[test]
     fn shutdown_drains_bursts_that_have_not_gone_quiet() {
         let bursts = EditBursts::new();
-        bursts.record("doc", "alan", "/a.md", "folder", 26);
-        bursts.record("doc", "alan", "/a.md", "folder", 14);
+        bursts.record(Edit {
+            doc_id: "doc",
+            user: "alan",
+            vpath: "/a.md",
+            channel: "folder",
+            clients: &[1],
+            bytes: 26,
+        });
+        bursts.record(Edit {
+            doc_id: "doc",
+            user: "alan",
+            vpath: "/a.md",
+            channel: "folder",
+            clients: &[1],
+            bytes: 14,
+        });
 
         let drained = bursts.drain_all();
         assert_eq!(drained.len(), 1);

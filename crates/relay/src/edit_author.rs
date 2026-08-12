@@ -60,28 +60,30 @@ pub fn user_for_update<T: ReadTxn>(txn: &T, update: &[u8]) -> Option<String> {
     }
 }
 
-/// The yjs client ids an update came from, comma-separated, or "-" when it
-/// names none.
+/// The yjs client ids an update came from, ascending.
 ///
 /// A user has one client id per device and session (PUD stores `ids` as an
-/// array), so this is what distinguishes "their laptop" from "their phone"
-/// when the same person appears to do something twice.
-pub fn clients_for_update(update: &[u8]) -> String {
+/// array), so this is what distinguishes "their laptop" from "their phone" when
+/// the same person appears to do something twice - and what keys anything
+/// describing the client rather than the person, such as its plugin version.
+pub fn clients_in_update(update: &[u8]) -> Vec<u64> {
     let Ok(decoded) = Update::decode_v1(update) else {
-        return "-".to_string();
+        return Vec::new();
     };
 
-    let mut ids: Vec<String> = _clients_in(&decoded)
-        .iter()
-        .map(u64::to_string)
-        .collect();
-    ids.sort();
+    let mut ids: Vec<u64> = _clients_in(&decoded).into_iter().collect();
+    ids.sort_unstable();
+    ids
+}
 
+/// The same client ids, comma-separated, or "-" when the update names none.
+pub fn clients_for_update(update: &[u8]) -> String {
+    let ids = clients_in_update(update);
     if ids.is_empty() {
-        "-".to_string()
-    } else {
-        ids.join(",")
+        return "-".to_string();
     }
+
+    ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",")
 }
 
 /// Same lookup, reading the PUD map out of the post-update snapshot the event
@@ -167,8 +169,10 @@ mod tests {
         let merged = yrs::Doc::new();
         {
             let mut txn = merged.transact_mut();
-            txn.apply_update(Update::decode_v1(&from_a).unwrap()).unwrap();
-            txn.apply_update(Update::decode_v1(&from_b).unwrap()).unwrap();
+            txn.apply_update(Update::decode_v1(&from_a).unwrap())
+                .unwrap();
+            txn.apply_update(Update::decode_v1(&from_b).unwrap())
+                .unwrap();
         }
         let combined = merged
             .transact()
