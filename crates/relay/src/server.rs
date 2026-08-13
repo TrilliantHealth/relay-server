@@ -1485,7 +1485,7 @@ async fn handle_socket_upgrade_with_channel_and_user(
     let doc_id_for_recorder = doc_id.clone();
     if let (Some(client_id), Some(v)) = (declared_client_id, version.as_deref()) {
         if let Some(recorded) = client_versions.declare(client_id, v, user_name.as_deref()) {
-            tracing::info!(
+            tracing::debug!(
                 client_id,
                 version = %recorded.version,
                 previous = %recorded.previous.as_deref().unwrap_or(client_versions::UNKNOWN),
@@ -1508,7 +1508,10 @@ async fn handle_socket_upgrade_with_channel_and_user(
                 connection_version: version.as_deref(),
             });
             if let Some(recorded) = recorded {
-                tracing::info!(
+                // The table is served by GET /client-versions; per-binding
+                // lines are debug because a declaring client emits one per
+                // doc it connects to.
+                tracing::debug!(
                     client_id,
                     version = %recorded.version,
                     previous = %recorded.previous.as_deref().unwrap_or("-"),
