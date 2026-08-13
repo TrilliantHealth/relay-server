@@ -91,10 +91,11 @@ type ClientVersionCallback = Box<dyn Fn(&AwarenessEntryFacts) + Send + Sync>;
 const SYNC_STATUS_MESSAGE: u8 = 102;
 
 /// An incoming update that grows the doc's delete set by at least this many
-/// clock units is logged. Clock units roughly correspond to characters for
-/// text content, so this catches section-or-larger deletions while ignoring
-/// ordinary editing.
-const LARGE_DELETION_CLOCK_SPAN: u32 = 200;
+/// clock units is logged. Clock units count operations, not characters - a
+/// character edited multiple times accumulates many clock units, so a small
+/// text deletion can produce a span in the hundreds. The forensic cases this
+/// targets (mass content reverts) are 5,000+ spans.
+const LARGE_DELETION_CLOCK_SPAN: u32 = 5000;
 
 fn deleted_spans_by_client<T: ReadTxn>(txn: &T) -> std::collections::HashMap<ClientID, u32> {
     txn.snapshot()

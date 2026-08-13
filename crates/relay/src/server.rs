@@ -786,6 +786,20 @@ impl Server {
                     let user_id = author.as_deref().or(event.user.as_deref());
                     let update_bytes = event.update.as_ref().map_or(0, Vec::len);
                     let vpath = vpath.as_deref().unwrap_or("-");
+                    // PUD registration and payload-driven PUD writes mutate
+                    // the doc under the server's own 53-bit client id. These
+                    // fire observe_update_v1 like any edit, but are internal
+                    // bookkeeping - not human-produced content changes.
+                    if event
+                        .update
+                        .as_deref()
+                        .is_some_and(edit_author::is_server_only_update)
+                    {
+                        let envelope =
+                            EventEnvelope::new(routing_channel_for_callback.clone(), event);
+                        dispatcher.send_event(envelope);
+                        return;
+                    }
                     // The client ids in the update are what a version is keyed
                     // on: one per device and session, unlike the user.
                     let edit_clients = event
@@ -1297,16 +1311,21 @@ struct HandlerParams {
     /// Plugin version, reported by clients >= 0.8.8-th.6. Absent on older
     /// clients - which is exactly what allowed_client_versions gates on.
     v: Option<String>,
-    /// The Yjs client id this connection's Y.Doc mints updates under,
-    /// pre-declared by the plugin so the id-version join needs no inference.
+    /// The Yjs client ids this connection's plugin mints updates under
+    /// (comma-separated; the connected Y.Doc plus any merge working copy),
+    /// pre-declared so the id-version join needs no inference.
     cid: Option<String>,
 }
 
 impl HandlerParams {
-    /// `cid` when present and parseable; a malformed value never rejects
-    /// the connection, it just leaves the join to inference.
-    fn declared_client_id(&self) -> Option<u64> {
-        self.cid.as_deref().and_then(|cid| cid.parse().ok())
+    /// `cid` ids when present and parseable (comma-separated; a single id is
+    /// the common case). Malformed values never reject the connection, they
+    /// just leave the join to inference.
+    fn declared_client_ids(&self) -> Vec<u64> {
+        self.cid
+            .as_deref()
+            .map(|cid| cid.split(',').filter_map(|id| id.parse().ok()).collect())
+            .unwrap_or_default()
     }
 }
 
@@ -1431,7 +1450,7 @@ async fn handle_socket_upgrade_with_channel_and_user(
     user: Option<String>,
     token: Option<String>,
     version: Option<String>,
-    declared_client_id: Option<u64>,
+    declared_client_ids: Vec<u64>,
     State(server_state): State<Arc<Server>>,
 ) -> Result<Response, AppError> {
     server_state
@@ -1482,7 +1501,10 @@ async fn handle_socket_upgrade_with_channel_and_user(
     // filed under are not known until updates arrive.
     let client_versions = server_state.client_versions.clone();
     let doc_id_for_recorder = doc_id.clone();
-    if let (Some(client_id), Some(v)) = (declared_client_id, version.as_deref()) {
+    for client_id in &declared_client_ids {
+        let client_id = *client_id;
+        let Some(v) = version.as_deref() else { break };
+
         if let Some(recorded) = client_versions.declare(client_id, v, user_name.as_deref()) {
             tracing::debug!(
                 client_id,
@@ -1494,8 +1516,8 @@ async fn handle_socket_upgrade_with_channel_and_user(
             );
         }
         // A cid declaration is the one authenticated id-user join we have:
-        // the token names the user, the client names its own id. Registering
-        // it in PUD at connect protects the id from ever being mis-bound by
+        // the token names the user, the client names its own ids. Registering
+        // them in PUD at connect protects them from ever being mis-bound by
         // update-delivery registration (first writer wins).
         if let (Some(user), true) = (user_for_pud.as_deref(), client_id >> 53 == 0) {
             let awareness = guard.awareness();
@@ -1646,7 +1668,7 @@ async fn handle_socket_upgrade_deprecated(
         user,
         params.token.clone(), // Pass the token from query params
         params.v.clone(),
-        params.declared_client_id(),
+        params.declared_client_ids(),
         State(server_state),
     )
     .await
@@ -1680,7 +1702,7 @@ async fn handle_socket_upgrade_full_path(
         user,
         params.token.clone(), // Pass the token from query params
         params.v.clone(),
-        params.declared_client_id(),
+        params.declared_client_ids(),
         State(server_state),
     )
     .await

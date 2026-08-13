@@ -35,7 +35,12 @@ fn _clients_in(update: &Update) -> HashSet<u64> {
         .state_vector_lower()
         .iter()
         .map(|(client_id, _)| client_id.get())
-        .chain(update.delete_set().iter().map(|(client_id, _)| client_id.get()))
+        .chain(
+            update
+                .delete_set()
+                .iter()
+                .map(|(client_id, _)| client_id.get()),
+        )
         .collect()
 }
 
@@ -74,6 +79,20 @@ pub fn clients_in_update(update: &[u8]) -> Vec<u64> {
     let mut ids: Vec<u64> = _clients_in(&decoded).into_iter().collect();
     ids.sort_unstable();
     ids
+}
+
+/// True when every client in the update is server-authored (53-bit yrs id,
+/// ≥ 2^32). PUD registration writes are the main case: the server mutates
+/// the doc's `users` map under its own client id, which fires
+/// `observe_update_v1` and would otherwise log a `Doc edited` line for
+/// internal bookkeeping that no human produced.
+pub fn is_server_only_update(update: &[u8]) -> bool {
+    let Ok(decoded) = Update::decode_v1(update) else {
+        return false;
+    };
+
+    let ids = _clients_in(&decoded);
+    !ids.is_empty() && ids.iter().all(|id| *id >= (1u64 << 32))
 }
 
 /// The same client ids, comma-separated, or "-" when the update names none.
