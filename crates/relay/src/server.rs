@@ -283,7 +283,7 @@ pub struct Server {
 type ClientVersionRecorder =
     Arc<dyn Fn(&y_sweet_core::doc_connection::AwarenessEntryFacts) + Send + Sync>;
 
-const DENIAL_LOG_INTERVAL: Duration = Duration::from_secs(300);
+const DENIAL_LOG_INTERVAL: Duration = Duration::from_secs(1800);
 
 struct DenialLogState {
     last_logged: Instant,
