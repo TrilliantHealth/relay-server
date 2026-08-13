@@ -278,10 +278,11 @@ pub struct Server {
 }
 
 /// Feeds awareness entries into the client-version table: (client id,
-/// declared version from the entry's payload, solo-live). The trust rules
-/// live in `client_versions.rs`; this closure carries the connection's own
-/// reported version so first introductions can be inferred from it.
-type ClientVersionRecorder = Arc<dyn Fn(u64, Option<&str>, bool) + Send + Sync>;
+/// declared version from the entry's payload, user.name from the payload,
+/// solo-live). The trust rules live in `client_versions.rs`; this closure
+/// carries the connection's own reported version so first introductions can
+/// be inferred from it.
+type ClientVersionRecorder = Arc<dyn Fn(u64, Option<&str>, Option<&str>, bool) + Send + Sync>;
 
 const DENIAL_LOG_INTERVAL: Duration = Duration::from_secs(300);
 
@@ -1483,24 +1484,26 @@ async fn handle_socket_upgrade_with_channel_and_user(
     let client_versions = server_state.client_versions.clone();
     let doc_id_for_recorder = doc_id.clone();
     if let (Some(client_id), Some(v)) = (declared_client_id, version.as_deref()) {
-        if let Some(recorded) = client_versions.declare(client_id, v) {
+        if let Some(recorded) = client_versions.declare(client_id, v, user_name.as_deref()) {
             tracing::info!(
                 client_id,
                 version = %recorded.version,
                 previous = %recorded.previous.as_deref().unwrap_or(client_versions::UNKNOWN),
+                name = %user_name.as_deref().unwrap_or("-"),
                 doc_id = %doc_id,
                 "Recorded client version"
             );
         }
     }
-    let record_client_version: ClientVersionRecorder =
-        Arc::new(move |client_id, declared: Option<&str>, solo_live| {
+    let record_client_version: ClientVersionRecorder = Arc::new(
+        move |client_id, declared: Option<&str>, name: Option<&str>, solo_live| {
             // One line per binding that changed the table - first sightings
             // and genuine declared-version changes - so an unversioned edit
             // can be traced to whether its client id was ever bound.
             let recorded = client_versions.observe(client_versions::Observation {
                 client_id,
                 declared,
+                name,
                 solo_live,
                 connection_version: version.as_deref(),
             });
@@ -1509,11 +1512,13 @@ async fn handle_socket_upgrade_with_channel_and_user(
                     client_id,
                     version = %recorded.version,
                     previous = %recorded.previous.as_deref().unwrap_or("-"),
+                    name = %name.unwrap_or("-"),
                     doc_id = %doc_id_for_recorder,
                     "Recorded client version"
                 );
             }
-        });
+        },
+    );
 
     // The guard moves into the upgrade closure: an abandoned upgrade
     // detaches via RAII.
@@ -1812,8 +1817,8 @@ async fn handle_socket_inner<S, T, E>(
             }
         },
     );
-    conn.set_on_client_version(Box::new(move |client_id, declared, solo_live| {
-        record_client_version(client_id, declared, solo_live)
+    conn.set_on_client_version(Box::new(move |client_id, declared, name, solo_live| {
+        record_client_version(client_id, declared, name, solo_live)
     }));
     conn.set_sync_kv(sync_kv);
     conn.set_doc_id(doc_id.clone());
@@ -1998,7 +2003,9 @@ async fn get_client_versions(
         "count": entries.len(),
         "client_versions": entries
             .into_iter()
-            .map(|(client_id, version)| (client_id.to_string(), Value::String(version)))
+            .map(|(client_id, version, name)| {
+                (client_id.to_string(), json!({"version": version, "name": name}))
+            })
             .collect::<serde_json::Map<String, Value>>(),
     })))
 }
@@ -3448,6 +3455,7 @@ mod test {
             .observe(client_versions::Observation {
                 client_id: 1,
                 declared: Some("0.8.9-th.2"),
+                name: None,
                 solo_live: true,
                 connection_version: None,
             });
@@ -3456,6 +3464,7 @@ mod test {
             .observe(client_versions::Observation {
                 client_id: 2,
                 declared: None,
+                name: None,
                 solo_live: true,
                 connection_version: Some("0.8.9-th.1"),
             });
@@ -3464,6 +3473,7 @@ mod test {
             .observe(client_versions::Observation {
                 client_id: 2,
                 declared: None,
+                name: None,
                 solo_live: true,
                 connection_version: Some("0.8.8-th.10"),
             });
@@ -4554,7 +4564,7 @@ mod test {
                 None,
                 None,
                 metrics.clone(),
-                Arc::new(|_client_id, _declared, _solo| {}),
+                Arc::new(|_client_id, _declared, _name, _solo| {}),
             ));
 
             SocketHarness {

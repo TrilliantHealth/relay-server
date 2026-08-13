@@ -35,7 +35,7 @@ type Callback = Arc<dyn Fn(&[u8]) + 'static>;
 type Callback = Arc<dyn Fn(&[u8]) + 'static + Send + Sync>;
 
 /// (client id, declared version from the awareness payload, solo-live).
-type ClientVersionCallback = Box<dyn Fn(u64, Option<&str>, bool) + Send + Sync>;
+type ClientVersionCallback = Box<dyn Fn(u64, Option<&str>, Option<&str>, bool) + Send + Sync>;
 
 const SYNC_STATUS_MESSAGE: u8 = 102;
 
@@ -530,7 +530,12 @@ impl DocConnection {
                             .as_ref()
                             .and_then(|s| s.get("relayVersion"))
                             .and_then(|v| v.as_str());
-                        callback(client_id.get(), declared, solo && live);
+                        let name = state
+                            .as_ref()
+                            .and_then(|s| s.get("user"))
+                            .and_then(|u| u.get("name"))
+                            .and_then(|n| n.as_str());
+                        callback(client_id.get(), declared, name, solo && live);
                     }
                 }
                 if update.clients.len() == 1 {
@@ -930,7 +935,7 @@ mod tests {
         let mut connection = DocConnection::new(awareness, Authorization::Full, |_| {});
         let seen: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
         let recorder = seen.clone();
-        connection.set_on_client_version(Box::new(move |id, _declared, _solo| {
+        connection.set_on_client_version(Box::new(move |id, _declared, _name, _solo| {
             recorder.lock().unwrap().push(id);
         }));
 
@@ -969,13 +974,16 @@ mod tests {
 
         let awareness = Arc::new(RwLock::new(Awareness::new(yrs::Doc::new())));
         let mut connection = DocConnection::new(awareness, Authorization::Full, |_| {});
-        let seen: Arc<Mutex<Vec<(u64, Option<String>, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen: Arc<Mutex<Vec<(u64, Option<String>, Option<String>, bool)>>> =
+            Arc::new(Mutex::new(Vec::new()));
         let recorder = seen.clone();
-        connection.set_on_client_version(Box::new(move |id, declared, solo| {
-            recorder
-                .lock()
-                .unwrap()
-                .push((id, declared.map(str::to_string), solo));
+        connection.set_on_client_version(Box::new(move |id, declared, name, solo| {
+            recorder.lock().unwrap().push((
+                id,
+                declared.map(str::to_string),
+                name.map(str::to_string),
+                solo,
+            ));
         }));
 
         connection
@@ -984,7 +992,7 @@ mod tests {
 
         assert_eq!(
             *seen.lock().unwrap(),
-            vec![(client_id, Some("0.8.9-th.2".to_string()), true)]
+            vec![(client_id, Some("0.8.9-th.2".to_string()), None, true)]
         );
     }
 
@@ -1003,20 +1011,26 @@ mod tests {
 
         let awareness = Arc::new(RwLock::new(Awareness::new(yrs::Doc::new())));
         let mut connection = DocConnection::new(awareness, Authorization::Full, |_| {});
-        let seen: Arc<Mutex<Vec<(u64, Option<String>, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen: Arc<Mutex<Vec<(u64, Option<String>, Option<String>, bool)>>> =
+            Arc::new(Mutex::new(Vec::new()));
         let recorder = seen.clone();
-        connection.set_on_client_version(Box::new(move |id, declared, solo| {
-            recorder
-                .lock()
-                .unwrap()
-                .push((id, declared.map(str::to_string), solo));
+        connection.set_on_client_version(Box::new(move |id, declared, name, solo| {
+            recorder.lock().unwrap().push((
+                id,
+                declared.map(str::to_string),
+                name.map(str::to_string),
+                solo,
+            ));
         }));
 
         connection
             .handle_msg(&DefaultProtocol, Message::Awareness(declared))
             .unwrap();
 
-        assert_eq!(*seen.lock().unwrap(), vec![(client_id, None, true)]);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(client_id, None, Some("x".to_string()), true)]
+        );
     }
 
     #[test]
@@ -1058,7 +1072,7 @@ mod tests {
         let mut connection = DocConnection::new(awareness, Authorization::Full, |_| {});
         let seen: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
         let recorder = seen.clone();
-        connection.set_on_client_version(Box::new(move |id, _declared, _solo| {
+        connection.set_on_client_version(Box::new(move |id, _declared, _name, _solo| {
             recorder.lock().unwrap().push(id);
         }));
 
