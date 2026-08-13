@@ -1297,6 +1297,17 @@ struct HandlerParams {
     /// Plugin version, reported by clients >= 0.8.8-th.6. Absent on older
     /// clients - which is exactly what allowed_client_versions gates on.
     v: Option<String>,
+    /// The Yjs client id this connection's Y.Doc mints updates under,
+    /// pre-declared by the plugin so the id-version join needs no inference.
+    cid: Option<String>,
+}
+
+impl HandlerParams {
+    /// `cid` when present and parseable; a malformed value never rejects
+    /// the connection, it just leaves the join to inference.
+    fn declared_client_id(&self) -> Option<u64> {
+        self.cid.as_deref().and_then(|cid| cid.parse().ok())
+    }
 }
 
 async fn get_doc_as_update(
@@ -1420,6 +1431,7 @@ async fn handle_socket_upgrade_with_channel_and_user(
     user: Option<String>,
     token: Option<String>,
     version: Option<String>,
+    declared_client_id: Option<u64>,
     State(server_state): State<Arc<Server>>,
 ) -> Result<Response, AppError> {
     server_state
@@ -1470,6 +1482,17 @@ async fn handle_socket_upgrade_with_channel_and_user(
     // filed under are not known until updates arrive.
     let client_versions = server_state.client_versions.clone();
     let doc_id_for_recorder = doc_id.clone();
+    if let (Some(client_id), Some(v)) = (declared_client_id, version.as_deref()) {
+        if let Some(recorded) = client_versions.declare(client_id, v) {
+            tracing::info!(
+                client_id,
+                version = %recorded.version,
+                previous = %recorded.previous.as_deref().unwrap_or(client_versions::UNKNOWN),
+                doc_id = %doc_id,
+                "Recorded client version"
+            );
+        }
+    }
     let record_client_version: ClientVersionRecorder =
         Arc::new(move |client_id, declared: Option<&str>, solo_live| {
             // One line per binding that changed the table - first sightings
@@ -1593,6 +1616,7 @@ async fn handle_socket_upgrade_deprecated(
         user,
         params.token.clone(), // Pass the token from query params
         params.v.clone(),
+        params.declared_client_id(),
         State(server_state),
     )
     .await
@@ -1626,6 +1650,7 @@ async fn handle_socket_upgrade_full_path(
         user,
         params.token.clone(), // Pass the token from query params
         params.v.clone(),
+        params.declared_client_id(),
         State(server_state),
     )
     .await

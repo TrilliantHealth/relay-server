@@ -2,9 +2,11 @@
 //!
 //! Two sources, by strength:
 //!
-//! - **Declared**: a `relayVersion` field inside the client's own awareness
+//! - **Declared**: the client's own statement of its id-version binding,
+//!   via either the `cid` upgrade query param (binding the id to the
+//!   connection's `v` param) or a `relayVersion` field inside its awareness
 //!   state payload. Minted by the id's owner, so it stays correct no matter
-//!   who relays the entry. Overrides everything.
+//!   who relays it. Overrides everything.
 //! - **Inferred**: the `v` query param of the connection that *introduced*
 //!   the id - the first live (non-null, solo) awareness entry the server has
 //!   ever seen for it. An echo can only echo what the server already
@@ -67,23 +69,34 @@ impl ClientVersions {
         Self::default()
     }
 
+    fn _declare(state: &mut _State, client_id: u64, version: &str) -> Option<Recorded> {
+        let previous = state.declared.insert(client_id, version.to_string());
+        if previous.as_deref() == Some(version) {
+            return None;
+        }
+
+        Some(Recorded {
+            version: version.to_string(),
+            previous,
+        })
+    }
+
+    /// A client's own pre-joined binding: the `cid` upgrade param names the
+    /// id, the connection's `v` param supplies the version. Same trust as an
+    /// awareness-payload declaration.
+    pub fn declare(&self, client_id: u64, version: &str) -> Option<Recorded> {
+        let mut state = self.state.write().unwrap();
+        state.seen.insert(client_id);
+        Self::_declare(&mut state, client_id, version)
+    }
+
     /// Feed one awareness entry through the trust rules.
     pub fn observe(&self, observation: Observation) -> Option<Recorded> {
         let mut state = self.state.write().unwrap();
         let never_seen = state.seen.insert(observation.client_id);
 
         if let Some(declared) = observation.declared {
-            let previous = state
-                .declared
-                .insert(observation.client_id, declared.to_string());
-            if previous.as_deref() == Some(declared) {
-                return None;
-            }
-
-            return Some(Recorded {
-                version: declared.to_string(),
-                previous,
-            });
+            return Self::_declare(&mut state, observation.client_id, declared);
         }
 
         if !(observation.solo_live && never_seen) {
@@ -276,6 +289,32 @@ mod tests {
         let versions = ClientVersions::new();
 
         assert_eq!(versions.describe(&[]), UNKNOWN);
+    }
+
+    #[test]
+    fn a_pre_joined_declaration_reports_bare() {
+        let versions = ClientVersions::new();
+        versions.declare(1, "0.8.9-th.2");
+
+        assert_eq!(versions.describe(&[1]), "0.8.9-th.2");
+    }
+
+    #[test]
+    fn a_pre_joined_declaration_blocks_later_inference() {
+        let versions = ClientVersions::new();
+        versions.declare(1, "0.8.9-th.2");
+        // The id is already seen and declared; an echoed introduction on
+        // some other connection changes nothing.
+        assert!(versions.observe(introduced(1, "0.8.8-th.10")).is_none());
+
+        assert_eq!(versions.describe(&[1]), "0.8.9-th.2");
+    }
+
+    #[test]
+    fn a_matching_payload_declaration_after_a_pre_join_logs_nothing() {
+        let versions = ClientVersions::new();
+        assert!(versions.declare(1, "0.8.9-th.2").is_some());
+        assert!(versions.observe(declared(1, "0.8.9-th.2")).is_none());
     }
 
     #[test]
