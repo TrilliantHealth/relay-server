@@ -35,7 +35,58 @@ type Callback = Arc<dyn Fn(&[u8]) + 'static>;
 type Callback = Arc<dyn Fn(&[u8]) + 'static + Send + Sync>;
 
 /// (client id, declared version from the awareness payload, solo-live).
-type ClientVersionCallback = Box<dyn Fn(u64, Option<&str>, Option<&str>, bool) + Send + Sync>;
+/// Facts extracted from one awareness entry, before any trust decision.
+/// Everything here except `solo_live` comes from the entry's own state
+/// payload, which is minted by the entry's owner and survives relaying.
+pub struct AwarenessEntryFacts {
+    pub client_id: u64,
+    /// `relayVersion` from the payload.
+    pub declared_version: Option<String>,
+    /// `user.name` from the payload.
+    pub user_name: Option<String>,
+    /// `user.id` from the payload - the relay user id, client-asserted, so
+    /// suitable for display attribution only.
+    pub user_id: Option<String>,
+    /// `relayClientIds` from the payload: additional client ids this plugin
+    /// mints edits under for this doc (e.g. a merge-recovery working copy).
+    pub extra_client_ids: Vec<u64>,
+    /// Non-null entry that arrived alone - the only shape eligible for
+    /// first-introduction inference.
+    pub solo_live: bool,
+}
+
+impl AwarenessEntryFacts {
+    fn from_entry(client_id: u64, json: &str, solo: bool) -> Self {
+        let live = json.trim() != "null";
+        let state = serde_json::from_str::<serde_json::Value>(json).ok();
+        let user = state.as_ref().and_then(|s| s.get("user"));
+        Self {
+            client_id,
+            declared_version: state
+                .as_ref()
+                .and_then(|s| s.get("relayVersion"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            user_name: user
+                .and_then(|u| u.get("name"))
+                .and_then(|n| n.as_str())
+                .map(str::to_string),
+            user_id: user
+                .and_then(|u| u.get("id"))
+                .and_then(|i| i.as_str())
+                .map(str::to_string),
+            extra_client_ids: state
+                .as_ref()
+                .and_then(|s| s.get("relayClientIds"))
+                .and_then(|ids| ids.as_array())
+                .map(|ids| ids.iter().filter_map(|id| id.as_u64()).collect())
+                .unwrap_or_default(),
+            solo_live: solo && live,
+        }
+    }
+}
+
+type ClientVersionCallback = Box<dyn Fn(&AwarenessEntryFacts) + Send + Sync>;
 
 const SYNC_STATUS_MESSAGE: u8 = 102;
 
@@ -367,7 +418,7 @@ impl DocConnection {
 
     /// Register a client_id in the "users" PermanentUserData map on the document.
     /// Takes a Doc reference directly to avoid re-locking awareness.
-    fn register_pud_client_id_on_doc(doc: &yrs::Doc, user_id: &str, client_id: ClientID) {
+    pub fn register_pud_client_id_on_doc(doc: &yrs::Doc, user_id: &str, client_id: ClientID) {
         // get_or_insert_map takes a write txn internally, call before any read txn.
         let users_map = doc.get_or_insert_map("users");
 
@@ -517,25 +568,39 @@ impl DocConnection {
                 protocol.handle_awareness_query(&awareness)
             }
             Message::Awareness(update) => {
+                let solo = update.clients.len() == 1;
+                let facts: Vec<AwarenessEntryFacts> = update
+                    .clients
+                    .iter()
+                    .map(|(client_id, entry)| {
+                        AwarenessEntryFacts::from_entry(client_id.get(), &entry.json, solo)
+                    })
+                    .collect();
                 if let Some(callback) = &self.on_client_version {
-                    let solo = update.clients.len() == 1;
-                    for (client_id, entry) in update.clients.iter() {
-                        // A declared version is read from any delivery - the
-                        // payload is minted by the entry's owner. All other
-                        // trust decisions belong to the caller, informed by
-                        // whether this entry could be a self-broadcast.
-                        let live = entry.json.trim() != "null";
-                        let state = serde_json::from_str::<serde_json::Value>(&entry.json).ok();
-                        let declared = state
-                            .as_ref()
-                            .and_then(|s| s.get("relayVersion"))
-                            .and_then(|v| v.as_str());
-                        let name = state
-                            .as_ref()
-                            .and_then(|s| s.get("user"))
-                            .and_then(|u| u.get("name"))
-                            .and_then(|n| n.as_str());
-                        callback(client_id.get(), declared, name, solo && live);
+                    // Payload facts are read from any delivery - the payload
+                    // is minted by the entry's owner. All other trust
+                    // decisions belong to the caller.
+                    for entry_facts in &facts {
+                        callback(entry_facts);
+                    }
+                }
+                // A payload that names its own user id binds its client ids
+                // to that user in the doc's PermanentUserData - owner-minted,
+                // so echo-safe, unlike binding to the delivering connection.
+                {
+                    let awareness = a.write().unwrap();
+                    for entry_facts in &facts {
+                        let Some(user_id) = &entry_facts.user_id else {
+                            continue;
+                        };
+
+                        let doc = awareness.doc();
+                        for id in std::iter::once(entry_facts.client_id)
+                            .chain(entry_facts.extra_client_ids.iter().copied())
+                            .filter(|id| id >> 53 == 0)
+                        {
+                            Self::register_pud_client_id_on_doc(doc, user_id, ClientID::new(id));
+                        }
                     }
                 }
                 if update.clients.len() == 1 {
@@ -935,8 +1000,8 @@ mod tests {
         let mut connection = DocConnection::new(awareness, Authorization::Full, |_| {});
         let seen: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
         let recorder = seen.clone();
-        connection.set_on_client_version(Box::new(move |id, _declared, _name, _solo| {
-            recorder.lock().unwrap().push(id);
+        connection.set_on_client_version(Box::new(move |facts| {
+            recorder.lock().unwrap().push(facts.client_id);
         }));
 
         connection
@@ -977,12 +1042,12 @@ mod tests {
         let seen: Arc<Mutex<Vec<(u64, Option<String>, Option<String>, bool)>>> =
             Arc::new(Mutex::new(Vec::new()));
         let recorder = seen.clone();
-        connection.set_on_client_version(Box::new(move |id, declared, name, solo| {
+        connection.set_on_client_version(Box::new(move |facts| {
             recorder.lock().unwrap().push((
-                id,
-                declared.map(str::to_string),
-                name.map(str::to_string),
-                solo,
+                facts.client_id,
+                facts.declared_version.clone(),
+                facts.user_name.clone(),
+                facts.solo_live,
             ));
         }));
 
@@ -1014,12 +1079,12 @@ mod tests {
         let seen: Arc<Mutex<Vec<(u64, Option<String>, Option<String>, bool)>>> =
             Arc::new(Mutex::new(Vec::new()));
         let recorder = seen.clone();
-        connection.set_on_client_version(Box::new(move |id, declared, name, solo| {
+        connection.set_on_client_version(Box::new(move |facts| {
             recorder.lock().unwrap().push((
-                id,
-                declared.map(str::to_string),
-                name.map(str::to_string),
-                solo,
+                facts.client_id,
+                facts.declared_version.clone(),
+                facts.user_name.clone(),
+                facts.solo_live,
             ));
         }));
 
@@ -1031,6 +1096,80 @@ mod tests {
             *seen.lock().unwrap(),
             vec![(client_id, None, Some("x".to_string()), true)]
         );
+    }
+
+    #[test]
+    fn extra_client_ids_in_the_payload_are_surfaced() {
+        use std::sync::Mutex;
+
+        let client_doc = yrs::Doc::new();
+        let mut client_awareness = Awareness::new(client_doc);
+        client_awareness.set_local_state(
+            r#"{"relayVersion":"0.8.9-th.3","relayClientIds":[42,7],"user":{"name":"x","id":"u1"}}"#,
+        );
+        let declared = client_awareness.update().unwrap();
+
+        let awareness = Arc::new(RwLock::new(Awareness::new(yrs::Doc::new())));
+        let mut connection = DocConnection::new(awareness, Authorization::Full, |_| {});
+        let seen: Arc<Mutex<Vec<(Vec<u64>, Option<String>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        connection.set_on_client_version(Box::new(move |facts| {
+            recorder
+                .lock()
+                .unwrap()
+                .push((facts.extra_client_ids.clone(), facts.user_id.clone()));
+        }));
+
+        connection
+            .handle_msg(&DefaultProtocol, Message::Awareness(declared))
+            .unwrap();
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(vec![42, 7], Some("u1".to_string()))]
+        );
+    }
+
+    #[test]
+    fn a_payload_user_id_binds_its_client_ids_in_pud() {
+        use yrs::Map;
+
+        let client_doc = yrs::Doc::new();
+        let client_id = client_doc.client_id().get();
+        let mut client_awareness = Awareness::new(client_doc);
+        client_awareness
+            .set_local_state(r#"{"relayClientIds":[42],"user":{"name":"x","id":"u1"}}"#);
+        let declared = client_awareness.update().unwrap();
+
+        let awareness = Arc::new(RwLock::new(Awareness::new(yrs::Doc::new())));
+        let mut connection = DocConnection::new(awareness.clone(), Authorization::Full, |_| {});
+        // No authenticated user on this connection: the binding must come
+        // from the payload, not the transport.
+        connection
+            .handle_msg(&DefaultProtocol, Message::Awareness(declared))
+            .unwrap();
+
+        let awareness = awareness.read().unwrap();
+        let txn = awareness.doc().transact();
+        let users_map = txn.get_map("users").expect("users map registered");
+        let Some(Out::YMap(user_map)) = users_map.get(&txn, "u1") else {
+            panic!("payload user id not registered");
+        };
+        let Some(Out::YArray(ids)) = user_map.get(&txn, "ids") else {
+            panic!("no ids array");
+        };
+        let mut registered: Vec<u64> = ids
+            .iter(&txn)
+            .filter_map(|item| match item {
+                Out::Any(yrs::Any::Number(n)) => Some(n as u64),
+                Out::Any(yrs::Any::BigInt(n)) => Some(n as u64),
+                _ => None,
+            })
+            .collect();
+        registered.sort_unstable();
+        let mut expected = vec![42, client_id];
+        expected.sort_unstable();
+        assert_eq!(registered, expected);
     }
 
     #[test]
@@ -1072,8 +1211,8 @@ mod tests {
         let mut connection = DocConnection::new(awareness, Authorization::Full, |_| {});
         let seen: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
         let recorder = seen.clone();
-        connection.set_on_client_version(Box::new(move |id, _declared, _name, _solo| {
-            recorder.lock().unwrap().push(id);
+        connection.set_on_client_version(Box::new(move |facts| {
+            recorder.lock().unwrap().push(facts.client_id);
         }));
 
         connection

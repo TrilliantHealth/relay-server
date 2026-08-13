@@ -277,12 +277,11 @@ pub struct Server {
     client_versions: Arc<ClientVersions>,
 }
 
-/// Feeds awareness entries into the client-version table: (client id,
-/// declared version from the entry's payload, user.name from the payload,
-/// solo-live). The trust rules live in `client_versions.rs`; this closure
-/// carries the connection's own reported version so first introductions can
-/// be inferred from it.
-type ClientVersionRecorder = Arc<dyn Fn(u64, Option<&str>, Option<&str>, bool) + Send + Sync>;
+/// Feeds awareness entries into the client-version table. The trust rules
+/// live in `client_versions.rs`; this closure carries the connection's own
+/// reported version so first introductions can be inferred from it.
+type ClientVersionRecorder =
+    Arc<dyn Fn(&y_sweet_core::doc_connection::AwarenessEntryFacts) + Send + Sync>;
 
 const DENIAL_LOG_INTERVAL: Duration = Duration::from_secs(300);
 
@@ -1494,34 +1493,57 @@ async fn handle_socket_upgrade_with_channel_and_user(
                 "Recorded client version"
             );
         }
+        // A cid declaration is the one authenticated id-user join we have:
+        // the token names the user, the client names its own id. Registering
+        // it in PUD at connect protects the id from ever being mis-bound by
+        // update-delivery registration (first writer wins).
+        if let (Some(user), true) = (user_for_pud.as_deref(), client_id >> 53 == 0) {
+            let awareness = guard.awareness();
+            let awareness = awareness.read().unwrap();
+            y_sweet_core::doc_connection::DocConnection::register_pud_client_id_on_doc(
+                awareness.doc(),
+                user,
+                yrs::block::ClientID::new(client_id),
+            );
+        }
     }
-    let record_client_version: ClientVersionRecorder = Arc::new(
-        move |client_id, declared: Option<&str>, name: Option<&str>, solo_live| {
-            // One line per binding that changed the table - first sightings
-            // and genuine declared-version changes - so an unversioned edit
-            // can be traced to whether its client id was ever bound.
-            let recorded = client_versions.observe(client_versions::Observation {
-                client_id,
-                declared,
-                name,
-                solo_live,
+    let record_client_version: ClientVersionRecorder = Arc::new(move |facts| {
+        let mut recordings = vec![(
+            facts.client_id,
+            client_versions.observe(client_versions::Observation {
+                client_id: facts.client_id,
+                declared: facts.declared_version.as_deref(),
+                name: facts.user_name.as_deref(),
+                solo_live: facts.solo_live,
                 connection_version: version.as_deref(),
-            });
-            if let Some(recorded) = recorded {
-                // The table is served by GET /client-versions; per-binding
-                // lines are debug because a declaring client emits one per
-                // doc it connects to.
-                tracing::debug!(
-                    client_id,
-                    version = %recorded.version,
-                    previous = %recorded.previous.as_deref().unwrap_or("-"),
-                    name = %name.unwrap_or("-"),
-                    doc_id = %doc_id_for_recorder,
-                    "Recorded client version"
-                );
-            }
-        },
-    );
+            }),
+        )];
+        // Extra ids (e.g. a merge-recovery working copy) carry the same
+        // owner-minted payload version and name as the entry's own id.
+        if let Some(declared) = facts.declared_version.as_deref() {
+            recordings.extend(facts.extra_client_ids.iter().map(|extra| {
+                (
+                    *extra,
+                    client_versions.declare(*extra, declared, facts.user_name.as_deref()),
+                )
+            }));
+        }
+        for (client_id, recorded) in recordings {
+            let Some(recorded) = recorded else { continue };
+
+            // The table is served by GET /client-versions; per-binding
+            // lines are debug because a declaring client emits one per
+            // doc it connects to.
+            tracing::debug!(
+                client_id,
+                version = %recorded.version,
+                previous = %recorded.previous.as_deref().unwrap_or("-"),
+                name = %facts.user_name.as_deref().unwrap_or("-"),
+                doc_id = %doc_id_for_recorder,
+                "Recorded client version"
+            );
+        }
+    });
 
     // The guard moves into the upgrade closure: an abandoned upgrade
     // detaches via RAII.
@@ -1820,9 +1842,7 @@ async fn handle_socket_inner<S, T, E>(
             }
         },
     );
-    conn.set_on_client_version(Box::new(move |client_id, declared, name, solo_live| {
-        record_client_version(client_id, declared, name, solo_live)
-    }));
+    conn.set_on_client_version(Box::new(move |facts| record_client_version(facts)));
     conn.set_sync_kv(sync_kv);
     conn.set_doc_id(doc_id.clone());
     if let Some(vpath) = vpath {
@@ -4567,7 +4587,7 @@ mod test {
                 None,
                 None,
                 metrics.clone(),
-                Arc::new(|_client_id, _declared, _name, _solo| {}),
+                Arc::new(|_facts| {}),
             ));
 
             SocketHarness {
