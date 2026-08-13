@@ -585,25 +585,12 @@ impl DocConnection {
                         callback(entry_facts);
                     }
                 }
-                // A payload that names its own user id binds its client ids
-                // to that user in the doc's PermanentUserData - owner-minted,
-                // so echo-safe, unlike binding to the delivering connection.
-                {
-                    let awareness = a.write().unwrap();
-                    for entry_facts in &facts {
-                        let Some(user_id) = &entry_facts.user_id else {
-                            continue;
-                        };
-
-                        let doc = awareness.doc();
-                        for id in std::iter::once(entry_facts.client_id)
-                            .chain(entry_facts.extra_client_ids.iter().copied())
-                            .filter(|id| id >> 53 == 0)
-                        {
-                            Self::register_pud_client_id_on_doc(doc, user_id, ClientID::new(id));
-                        }
-                    }
-                }
+                // PUD registration from payload user.id was here but caused a
+                // sync regression: the write lock + transact_mut per awareness
+                // message serialized against the sync path on reconnect. The
+                // cid upgrade path already registers declaring clients in PUD
+                // outside the message loop; delivery-time registration covers
+                // legacy clients. The awareness path was defense-in-depth only.
                 if update.clients.len() == 1 {
                     let client_id = update.clients.keys().next().unwrap();
                     self.client_id.get_or_init(|| *client_id);
@@ -1129,48 +1116,6 @@ mod tests {
             *seen.lock().unwrap(),
             vec![(vec![42, 7], Some("u1".to_string()))]
         );
-    }
-
-    #[test]
-    fn a_payload_user_id_binds_its_client_ids_in_pud() {
-        use yrs::Map;
-
-        let client_doc = yrs::Doc::new();
-        let client_id = client_doc.client_id().get();
-        let mut client_awareness = Awareness::new(client_doc);
-        client_awareness
-            .set_local_state(r#"{"relayClientIds":[42],"user":{"name":"x","id":"u1"}}"#);
-        let declared = client_awareness.update().unwrap();
-
-        let awareness = Arc::new(RwLock::new(Awareness::new(yrs::Doc::new())));
-        let mut connection = DocConnection::new(awareness.clone(), Authorization::Full, |_| {});
-        // No authenticated user on this connection: the binding must come
-        // from the payload, not the transport.
-        connection
-            .handle_msg(&DefaultProtocol, Message::Awareness(declared))
-            .unwrap();
-
-        let awareness = awareness.read().unwrap();
-        let txn = awareness.doc().transact();
-        let users_map = txn.get_map("users").expect("users map registered");
-        let Some(Out::YMap(user_map)) = users_map.get(&txn, "u1") else {
-            panic!("payload user id not registered");
-        };
-        let Some(Out::YArray(ids)) = user_map.get(&txn, "ids") else {
-            panic!("no ids array");
-        };
-        let mut registered: Vec<u64> = ids
-            .iter(&txn)
-            .filter_map(|item| match item {
-                Out::Any(yrs::Any::Number(n)) => Some(n as u64),
-                Out::Any(yrs::Any::BigInt(n)) => Some(n as u64),
-                _ => None,
-            })
-            .collect();
-        registered.sort_unstable();
-        let mut expected = vec![42, client_id];
-        expected.sort_unstable();
-        assert_eq!(registered, expected);
     }
 
     #[test]
