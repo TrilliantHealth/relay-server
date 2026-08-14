@@ -1,6 +1,8 @@
 use crate::client_versions::{self, ClientVersions};
 use crate::doc_lifecycle::{AttachGuard, AttachKind, DocRegistry, LifecycleConfig};
 use crate::edit_author;
+use crate::edit_bursts::{self, EditBursts, Verdict};
+use crate::vpath_index::VPathIndex;
 use anyhow::{anyhow, Result};
 use axum::{
     body::Bytes,
@@ -250,6 +252,10 @@ pub struct Server {
     allowed_client_versions: HashSet<String>,
     denial_log_throttle: Mutex<HashMap<String, DenialLogState>>,
     client_versions: Arc<ClientVersions>,
+    vpath_index: Arc<VPathIndex>,
+    user_names: Arc<HashMap<String, String>>,
+    edit_bursts: Arc<EditBursts>,
+    semantic_logging: bool,
 }
 
 type ClientVersionRecorder =
@@ -331,6 +337,10 @@ impl Server {
             allowed_client_versions: HashSet::new(),
             denial_log_throttle: Mutex::new(HashMap::new()),
             client_versions: Arc::new(ClientVersions::new()),
+            vpath_index: Arc::new(VPathIndex::default()),
+            user_names: Arc::new(HashMap::new()),
+            edit_bursts: Arc::new(EditBursts::new()),
+            semantic_logging: false,
         })
     }
 
@@ -344,6 +354,23 @@ impl Server {
                 "Requiring client version in {:?} for doc websocket access",
                 self.allowed_client_versions
             );
+        }
+        self
+    }
+
+    pub fn with_user_names(mut self, names: impl IntoIterator<Item = (String, String)>) -> Self {
+        let names: HashMap<String, String> = names.into_iter().collect();
+        if !names.is_empty() {
+            tracing::info!("Loaded display names for {} user id(s)", names.len());
+        }
+        self.user_names = Arc::new(names);
+        self
+    }
+
+    pub fn with_semantic_logging(mut self, enabled: bool) -> Self {
+        self.semantic_logging = enabled;
+        if enabled {
+            tracing::info!("Semantic logging enabled: edit attribution, vpath resolution, and /client-versions endpoint are active");
         }
         self
     }
@@ -391,6 +418,11 @@ impl Server {
             _ => {
                 if let Some(suppressed) = self.denial_log_permit(user) {
                     tracing::warn!(
+                        name = %self
+                            .user_names
+                            .get(user)
+                            .map(String::as_str)
+                            .unwrap_or("<none>"),
                         user = %user,
                         version = %version.unwrap_or("none"),
                         allowed = %self
@@ -564,21 +596,21 @@ impl Server {
             let routing_channel_for_callback = routing_channel_name.clone();
             let user_for_callback = user.clone();
             let registry = self.registry.clone();
+            let vpath_index = self.vpath_index.clone();
+            let user_names = self.user_names.clone();
+            let edit_bursts = self.edit_bursts.clone();
+            let client_versions = self.client_versions.clone();
             let doc_id_for_callback = doc_id.to_string();
-            // The parent pin lives in this closure, which the doc owns via
-            // its SyncKv observer: the guard detaches when the doc drops.
+            let semantic = self.semantic_logging;
             let _parent_guard = parent_guard;
 
             if let Some(dispatcher) = event_dispatcher {
                 Some(Arc::new(move |mut event: DocumentUpdatedEvent| {
-                    // Keep the parent pin alive by referencing it in the closure
                     let _ = &_parent_guard;
-                    // Add user to event if available
                     if let Some(ref user) = user_for_callback {
                         event.user = Some(user.clone());
                     }
 
-                    // Update parent's subdoc snapshot index
                     if routing_channel_for_callback != doc_id_for_callback {
                         if let Some(snapshot) = &event.snapshot {
                             if let Some(parent) = registry.peek(&routing_channel_for_callback) {
@@ -588,19 +620,126 @@ impl Server {
                         }
                     }
 
-                    // PUD registration and payload-driven PUD writes mutate
-                    // the doc under the server's own 53-bit client id. These
-                    // fire observe_update_v1 like any edit, but are internal
-                    // bookkeeping - not human-produced content changes.
-                    if event
-                        .update
-                        .as_deref()
-                        .is_some_and(edit_author::is_server_only_update)
-                    {
-                        let envelope =
-                            EventEnvelope::new(routing_channel_for_callback.clone(), event);
-                        dispatcher.send_event(envelope);
-                        return;
+                    let edited_doc_id = event.doc_id.as_str();
+                    let channel = event
+                        .metadata
+                        .get("channel")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(&routing_channel_for_callback);
+
+                    if semantic {
+                        let editing_folder_doc = channel == edited_doc_id;
+                        let folder = if editing_folder_doc {
+                            None
+                        } else {
+                            registry.peek(channel)
+                        };
+
+                        if editing_folder_doc {
+                            if let Some(delta) = event.snapshot.as_deref().and_then(|state| {
+                                vpath_index.sync_membership_from_snapshot(channel, state)
+                            }) {
+                                let by = match (&event.update, &event.snapshot) {
+                                    (Some(update), Some(state)) => {
+                                        edit_author::user_from_snapshot(state, update)
+                                    }
+                                    _ => None,
+                                };
+                                let by = by.as_deref().or(event.user.as_deref());
+
+                                tracing::info!(
+                                    added = %delta.added.join(","),
+                                    removed = %delta.removed.join(","),
+                                    moved = %delta
+                                        .moved
+                                        .iter()
+                                        .map(|(from, to)| format!("{from}->{to}"))
+                                        .collect::<Vec<_>>()
+                                        .join(","),
+                                    name = %by
+                                        .and_then(|id| user_names.get(id))
+                                        .map(String::as_str)
+                                        .unwrap_or("<none>"),
+                                    user = %by.unwrap_or("-"),
+                                    clients = %event
+                                        .update
+                                        .as_deref()
+                                        .map(edit_author::clients_for_update)
+                                        .unwrap_or_else(|| "-".to_string()),
+                                    channel = %channel,
+                                    "Folder membership changed"
+                                );
+                            }
+                        }
+
+                        let vpath = folder
+                            .and_then(|folder| vpath_index.resolve(channel, &folder, edited_doc_id));
+
+                        let author = match (&event.update, &event.snapshot) {
+                            (Some(update), Some(state)) => {
+                                edit_author::user_from_snapshot(state, update)
+                            }
+                            _ => None,
+                        };
+
+                        let user_id = author.as_deref().or(event.user.as_deref());
+                        let update_bytes = event.update.as_ref().map_or(0, Vec::len);
+                        let vpath_str = vpath.as_deref().unwrap_or("-");
+
+                        if event
+                            .update
+                            .as_deref()
+                            .is_some_and(edit_author::is_server_only_update)
+                        {
+                            let envelope =
+                                EventEnvelope::new(routing_channel_for_callback.clone(), event);
+                            dispatcher.send_event(envelope);
+                            return;
+                        }
+
+                        let edit_clients = event
+                            .update
+                            .as_deref()
+                            .map(edit_author::clients_in_update)
+                            .unwrap_or_default();
+                        if let Verdict::Leading = edit_bursts.record(edit_bursts::Edit {
+                            doc_id: edited_doc_id,
+                            user: user_id.unwrap_or("-"),
+                            vpath: vpath_str,
+                            channel,
+                            clients: &edit_clients,
+                            bytes: update_bytes,
+                        }) {
+                            tracing::info!(
+                                vpath = %vpath_str,
+                                name = %user_id
+                                    .and_then(|id| user_names.get(id))
+                                    .map(String::as_str)
+                                    .unwrap_or("<none>"),
+                                user = %user_id.unwrap_or("-"),
+                                version = %client_versions.describe(&edit_clients),
+                                clients = %edit_clients
+                                    .iter()
+                                    .map(u64::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(","),
+                                update_bytes,
+                                doc_id = %edited_doc_id,
+                                channel = %channel,
+                                "Doc edited"
+                            );
+                        }
+                    } else {
+                        if event
+                            .update
+                            .as_deref()
+                            .is_some_and(edit_author::is_server_only_update)
+                        {
+                            let envelope =
+                                EventEnvelope::new(routing_channel_for_callback.clone(), event);
+                            dispatcher.send_event(envelope);
+                            return;
+                        }
                     }
 
                     let envelope = EventEnvelope::new(routing_channel_for_callback.clone(), event);
@@ -624,7 +763,6 @@ impl Server {
         )
         .await?;
 
-        // If channel is provided in token, store it in document metadata
         if let Some(channel_name) = routing_channel {
             dwskv.set_channel(&channel_name);
         }
@@ -859,6 +997,10 @@ impl Server {
             )
             .route("/webhook/reload", post(reload_webhook_config_endpoint));
 
+        if self.semantic_logging {
+            router = router.route("/client-versions", get(get_client_versions));
+        }
+
         // Only add file endpoints if a store is configured
         if let Some(store) = &self.store {
             // Add presigned URL endpoints for all stores
@@ -909,6 +1051,50 @@ impl Server {
         } else {
             app.layer(middleware::from_fn(Self::redact_error_middleware))
         };
+
+        if self.semantic_logging {
+            let bursts = self.edit_bursts.clone();
+            let burst_token = self.cancellation_token.clone();
+            let burst_user_names = self.user_names.clone();
+            let burst_client_versions = self.client_versions.clone();
+            let log_edit_bursts = move |finished: Vec<edit_bursts::FinishedBurst>| {
+                for burst in finished {
+                    tracing::info!(
+                        vpath = %burst.vpath,
+                        name = %burst_user_names
+                            .get(&burst.user)
+                            .map(String::as_str)
+                            .unwrap_or("<none>"),
+                        user = %burst.user,
+                        version = %burst_client_versions.describe(&burst.clients),
+                        clients = %burst
+                            .clients
+                            .iter()
+                            .map(u64::to_string)
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        edits = burst.edits,
+                        update_bytes = burst.bytes,
+                        span_ms = burst.span.as_millis(),
+                        doc_id = %burst.doc_id,
+                        channel = %burst.channel,
+                        "Doc edit burst"
+                    );
+                }
+            };
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(edit_bursts::BURST_QUIET / 4);
+                loop {
+                    tokio::select! {
+                        _ = ticker.tick() => log_edit_bursts(bursts.take_finished()),
+                        _ = burst_token.cancelled() => {
+                            log_edit_bursts(bursts.drain_all());
+                            break;
+                        }
+                    }
+                }
+            });
+        }
 
         tracing::info!("Starting HTTP server...");
         axum::serve(listener, app.into_make_service())
@@ -1106,10 +1292,21 @@ async fn handle_socket_upgrade_with_channel_and_user(
     };
 
     let user_for_pud = user.clone();
+    let channel_for_vpath = routing_channel.clone();
     let guard = server_state
         .attach_doc(&doc_id, AttachKind::Socket, routing_channel, user)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let vpath = channel_for_vpath.as_deref().and_then(|channel| {
+        server_state
+            .registry
+            .peek(channel)
+            .and_then(|folder| server_state.vpath_index.resolve(channel, &folder, &doc_id))
+    });
+    let user_name = user_for_pud
+        .as_deref()
+        .and_then(|id| server_state.user_names.get(id))
+        .cloned();
     let cancellation_token = server_state.doc_close_token.clone();
     let sync_protocol_event_sender = server_state.sync_protocol_event_sender.clone();
     let metrics = server_state.metrics.clone();
@@ -1120,11 +1317,12 @@ async fn handle_socket_upgrade_with_channel_and_user(
         let client_id = *client_id;
         let Some(v) = version.as_deref() else { break };
 
-        if let Some(recorded) = client_versions.declare(client_id, v) {
+        if let Some(recorded) = client_versions.declare(client_id, v, user_name.as_deref()) {
             tracing::debug!(
                 client_id,
                 version = %recorded.version,
                 previous = %recorded.previous.as_deref().unwrap_or(client_versions::UNKNOWN),
+                name = %user_name.as_deref().unwrap_or("-"),
                 doc_id = %doc_id,
                 "Recorded client version"
             );
@@ -1145,13 +1343,17 @@ async fn handle_socket_upgrade_with_channel_and_user(
             client_versions.observe(client_versions::Observation {
                 client_id: facts.client_id,
                 declared: facts.declared_version.as_deref(),
+                name: facts.user_name.as_deref(),
                 solo_live: facts.solo_live,
                 connection_version: version.as_deref(),
             }),
         )];
         if let Some(declared) = facts.declared_version.as_deref() {
             recordings.extend(facts.extra_client_ids.iter().map(|extra| {
-                (*extra, client_versions.declare(*extra, declared))
+                (
+                    *extra,
+                    client_versions.declare(*extra, declared, facts.user_name.as_deref()),
+                )
             }));
         }
         for (client_id, recorded) in recordings {
@@ -1161,6 +1363,7 @@ async fn handle_socket_upgrade_with_channel_and_user(
                 client_id,
                 version = %recorded.version,
                 previous = %recorded.previous.as_deref().unwrap_or("-"),
+                name = %facts.user_name.as_deref().unwrap_or("-"),
                 doc_id = %doc_id_for_recorder,
                 "Recorded client version"
             );
@@ -1177,6 +1380,8 @@ async fn handle_socket_upgrade_with_channel_and_user(
             cancellation_token,
             sync_protocol_event_sender,
             doc_id_clone,
+            vpath,
+            user_name,
             metrics,
             record_client_version,
         )
@@ -1312,6 +1517,8 @@ async fn handle_socket(
     cancellation_token: CancellationToken,
     sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
     doc_id: String,
+    vpath: Option<String>,
+    user_name: Option<String>,
     metrics: Arc<RelayMetrics>,
     record_client_version: ClientVersionRecorder,
 ) {
@@ -1326,6 +1533,8 @@ async fn handle_socket(
         cancellation_token,
         sync_protocol_event_sender,
         doc_id,
+        vpath,
+        user_name,
         metrics,
         record_client_version,
     )
@@ -1345,6 +1554,8 @@ async fn handle_socket_inner<S, T, E>(
     cancellation_token: CancellationToken,
     sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
     doc_id: String,
+    vpath: Option<String>,
+    user_name: Option<String>,
     metrics: Arc<RelayMetrics>,
     record_client_version: ClientVersionRecorder,
 ) where
@@ -1426,6 +1637,12 @@ async fn handle_socket_inner<S, T, E>(
     conn.set_on_client_version(Box::new(move |facts| {
         record_client_version(facts);
     }));
+    if let Some(vpath) = vpath {
+        conn.set_vpath(vpath);
+    }
+    if let Some(user_name) = user_name {
+        conn.set_user_name(user_name);
+    }
     if let Some(user) = user {
         conn.set_user(user);
     }
@@ -1541,6 +1758,24 @@ async fn handle_socket_inner<S, T, E>(
     // was still holding — before the machine's park window can open.
     drop(connection);
     drop(guard);
+}
+
+async fn get_client_versions(
+    auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
+    State(server_state): State<Arc<Server>>,
+) -> Result<Json<Value>, AppError> {
+    server_state.check_auth(auth_header)?;
+
+    let entries = server_state.client_versions.snapshot();
+    Ok(Json(json!({
+        "count": entries.len(),
+        "client_versions": entries
+            .into_iter()
+            .map(|(client_id, version, name)| {
+                (client_id.to_string(), json!({"version": version, "name": name}))
+            })
+            .collect::<serde_json::Map<String, Value>>(),
+    })))
 }
 
 async fn check_store(
@@ -3743,6 +3978,8 @@ mod test {
                 server_token,
                 Arc::new(SyncProtocolEventSender::new()),
                 "test_doc".to_string(),
+                None,
+                None,
                 metrics.clone(),
                 Arc::new(|_| {}),
             ));

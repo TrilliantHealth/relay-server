@@ -1,4 +1,4 @@
-//! Plugin version per Yjs client id, for annotating logs and gating access.
+//! Plugin version per Yjs client id, for annotating logs.
 //!
 //! Two sources, by strength:
 //!
@@ -25,22 +25,41 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
+/// Reported when no source has named a version for a client id: the client
+/// has not declared one and its introduction was not attributable.
 pub const UNKNOWN: &str = "-";
 
 #[derive(Default)]
 struct _State {
+    /// relayVersion payloads: owner-minted, overwritable (an upgraded client
+    /// re-declares under a new id, but a corrected payload should win).
     declared: HashMap<u64, String>,
+    /// First-introduction bindings: connection-inferred, immutable.
     inferred: HashMap<u64, String>,
+    /// Every id ever seen in any awareness entry, live or leave, solo or
+    /// relayed. An id already seen may be an echo, so it is never inferable.
     seen: HashSet<u64>,
+    /// `user.name` from awareness payloads (or the authenticated user on a
+    /// `cid` declaration). Payload content is owner-minted, so a name may be
+    /// taken from any delivery, relayed or not.
+    names: HashMap<u64, String>,
 }
 
 pub struct Observation<'a> {
     pub client_id: u64,
+    /// `relayVersion` from the entry's state payload, when present.
     pub declared: Option<&'a str>,
+    /// `user.name` from the entry's state payload, when present.
+    pub name: Option<&'a str>,
+    /// True only for a non-null entry that arrived alone: the shape of a
+    /// client broadcasting its own state, and the only shape eligible to
+    /// bind the connection's reported version.
     pub solo_live: bool,
+    /// The `v` query param of the connection this entry arrived on.
     pub connection_version: Option<&'a str>,
 }
 
+/// A recording that changed the table, so the caller can log the transition.
 pub struct Recorded {
     pub version: String,
     pub previous: Option<String>,
@@ -68,15 +87,26 @@ impl ClientVersions {
         })
     }
 
-    pub fn declare(&self, client_id: u64, version: &str) -> Option<Recorded> {
+    /// A client's own pre-joined binding: the `cid` upgrade param names the
+    /// id, the connection's `v` param supplies the version, and the
+    /// connection's authenticated user supplies the name. Same trust as an
+    /// awareness-payload declaration.
+    pub fn declare(&self, client_id: u64, version: &str, name: Option<&str>) -> Option<Recorded> {
         let mut state = self.state.write().unwrap();
         state.seen.insert(client_id);
+        if let Some(name) = name {
+            state.names.insert(client_id, name.to_string());
+        }
         Self::_declare(&mut state, client_id, version)
     }
 
+    /// Feed one awareness entry through the trust rules.
     pub fn observe(&self, observation: Observation) -> Option<Recorded> {
         let mut state = self.state.write().unwrap();
         let never_seen = state.seen.insert(observation.client_id);
+        if let Some(name) = observation.name {
+            state.names.insert(observation.client_id, name.to_string());
+        }
 
         if let Some(declared) = observation.declared {
             return Self::_declare(&mut state, observation.client_id, declared);
@@ -107,6 +137,11 @@ impl ClientVersions {
             .map(|version| format!("~{version}"))
     }
 
+    /// The version to print for the clients an update names.
+    ///
+    /// One version for the usual single-client edit; comma-separated when an
+    /// update merges several, so a mixed-build merge is visible rather than
+    /// silently reported as one build. `UNKNOWN` when none are recorded.
     pub fn describe(&self, client_ids: &[u64]) -> String {
         let state = self.state.read().unwrap();
         let mut versions: Vec<String> = client_ids
@@ -123,18 +158,21 @@ impl ClientVersions {
         versions.join(",")
     }
 
-    pub fn snapshot(&self) -> Vec<(u64, String)> {
+    /// Every known (client id, version, payload name), `~`-prefixed where
+    /// inferred, sorted by client id so successive reads diff cleanly.
+    pub fn snapshot(&self) -> Vec<(u64, String, Option<String>)> {
         let state = self.state.read().unwrap();
-        let mut entries: Vec<(u64, String)> = state
+        let mut entries: Vec<(u64, String, Option<String>)> = state
             .declared
             .keys()
             .chain(state.inferred.keys())
             .filter_map(|client_id| {
-                Self::_lookup(&state, *client_id).map(|version| (*client_id, version))
+                Self::_lookup(&state, *client_id)
+                    .map(|version| (*client_id, version, state.names.get(client_id).cloned()))
             })
             .collect();
-        entries.sort_unstable_by_key(|(client_id, _)| *client_id);
-        entries.dedup_by_key(|(client_id, _)| *client_id);
+        entries.sort_unstable_by_key(|(client_id, ..)| *client_id);
+        entries.dedup_by_key(|(client_id, ..)| *client_id);
         entries
     }
 }
@@ -147,6 +185,7 @@ mod tests {
         Observation {
             client_id,
             declared: Some(version),
+            name: None,
             solo_live: true,
             connection_version: None,
         }
@@ -156,6 +195,7 @@ mod tests {
         Observation {
             client_id,
             declared: None,
+            name: None,
             solo_live: true,
             connection_version: Some(connection_version),
         }
@@ -181,6 +221,7 @@ mod tests {
     fn an_echo_after_introduction_cannot_rebind() {
         let versions = ClientVersions::new();
         versions.observe(introduced(1, "0.8.9-th.1"));
+        // Another connection echoes the same id with its own version.
         assert!(versions.observe(introduced(1, "0.8.8-th.10")).is_none());
 
         assert_eq!(versions.describe(&[1]), "~0.8.9-th.1");
@@ -189,12 +230,15 @@ mod tests {
     #[test]
     fn an_id_first_seen_in_a_relay_is_never_inferable() {
         let versions = ClientVersions::new();
+        // Seen first in a full-map relay: not solo, so only marked seen.
         versions.observe(Observation {
             client_id: 1,
             declared: None,
+            name: None,
             solo_live: false,
             connection_version: Some("0.8.9-th.1"),
         });
+        // The later solo entry may be an echo of that relay - no binding.
         assert!(versions.observe(introduced(1, "0.8.9-th.1")).is_none());
 
         assert_eq!(versions.describe(&[1]), UNKNOWN);
@@ -225,6 +269,7 @@ mod tests {
             .observe(Observation {
                 client_id: 1,
                 declared: None,
+                name: None,
                 solo_live: true,
                 connection_version: None,
             })
@@ -267,7 +312,7 @@ mod tests {
     #[test]
     fn a_pre_joined_declaration_reports_bare() {
         let versions = ClientVersions::new();
-        versions.declare(1, "0.8.9-th.2");
+        versions.declare(1, "0.8.9-th.2", Some("Pat"));
 
         assert_eq!(versions.describe(&[1]), "0.8.9-th.2");
     }
@@ -275,7 +320,9 @@ mod tests {
     #[test]
     fn a_pre_joined_declaration_blocks_later_inference() {
         let versions = ClientVersions::new();
-        versions.declare(1, "0.8.9-th.2");
+        versions.declare(1, "0.8.9-th.2", Some("Pat"));
+        // The id is already seen and declared; an echoed introduction on
+        // some other connection changes nothing.
         assert!(versions.observe(introduced(1, "0.8.8-th.10")).is_none());
 
         assert_eq!(versions.describe(&[1]), "0.8.9-th.2");
@@ -284,7 +331,7 @@ mod tests {
     #[test]
     fn a_matching_payload_declaration_after_a_pre_join_logs_nothing() {
         let versions = ClientVersions::new();
-        assert!(versions.declare(1, "0.8.9-th.2").is_some());
+        assert!(versions.declare(1, "0.8.9-th.2", None).is_some());
         assert!(versions.observe(declared(1, "0.8.9-th.2")).is_none());
     }
 
@@ -297,8 +344,8 @@ mod tests {
         assert_eq!(
             versions.snapshot(),
             vec![
-                (10, "0.8.9-th.2".to_string()),
-                (20, "~0.8.9-th.1".to_string()),
+                (10, "0.8.9-th.2".to_string(), None),
+                (20, "~0.8.9-th.1".to_string(), None),
             ]
         );
     }
