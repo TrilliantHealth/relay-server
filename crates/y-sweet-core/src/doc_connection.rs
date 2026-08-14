@@ -450,7 +450,7 @@ impl DocConnection {
                         subscriptions.len()
                     );
                 } else {
-                    tracing::warn!("Failed to acquire event subscriptions lock for subscribe");
+                    tracing::warn!(user = ?self.user, "Failed to acquire event subscriptions lock for subscribe");
                 }
                 Ok(None)
             }
@@ -465,7 +465,7 @@ impl DocConnection {
                         subscriptions.len()
                     );
                 } else {
-                    tracing::warn!("Failed to acquire event subscriptions lock for unsubscribe");
+                    tracing::warn!(user = ?self.user, "Failed to acquire event subscriptions lock for unsubscribe");
                 }
                 Ok(None)
             }
@@ -677,12 +677,12 @@ impl DocConnection {
             }
             Message::Subdocs(_) => {
                 // Server shouldn't receive Subdocs from clients
-                tracing::warn!("Client sent Subdocs message to server, ignoring");
+                tracing::warn!(user = ?self.user, "Client sent Subdocs message to server, ignoring");
                 Ok(None)
             }
             Message::Event(_event_data) => {
                 // Clients shouldn't send events to the server, but we'll just log and ignore
-                tracing::warn!("Client sent event message to server, ignoring");
+                tracing::warn!(user = ?self.user, "Client sent event message to server, ignoring");
                 Ok(None)
             }
             Message::Custom(tag, data) => {
@@ -698,7 +698,7 @@ impl DocConnection {
         let is_subscribed = if let Ok(subscriptions) = self.event_subscriptions.read() {
             subscriptions.contains(&event.event_type)
         } else {
-            tracing::warn!("Failed to acquire event subscriptions lock for send_event");
+            tracing::warn!(user = ?self.user, "Failed to acquire event subscriptions lock for send_event");
             return Ok(()); // Fail silently
         };
 
