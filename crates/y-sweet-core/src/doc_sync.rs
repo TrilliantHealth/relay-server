@@ -71,11 +71,23 @@ impl DocWithSyncKv {
                     let state = txn.encode_state_as_update_v1(&StateVector::default());
 
                     // Create the event payload with business data, metadata, update, and snapshot
-                    let event = DocumentUpdatedEvent::new(doc_key.clone())
+                    let mut event = DocumentUpdatedEvent::new(doc_key.clone())
                         .with_metadata(&sync_kv)
                         .with_update(event.update.to_vec())
                         .with_snapshot(snapshot)
                         .with_state(state);
+
+                    // The writing connection tags its transaction with the
+                    // authenticated user. SERVER_ORIGIN marks the server's own
+                    // PUD bookkeeping, which has no author to report.
+                    if let Some(author) = txn.origin() {
+                        match std::str::from_utf8(author.as_ref()) {
+                            Ok(user) if user != crate::doc_connection::SERVER_ORIGIN => {
+                                event = event.with_user(user.to_string());
+                            }
+                            _ => {}
+                        }
+                    }
 
                     // Callback handles envelope creation and dispatch
                     callback(event);

@@ -145,7 +145,26 @@ pub trait Protocol {
         awareness: &mut Awareness,
         update: Update,
     ) -> Result<Option<Message>, Error> {
-        let mut txn = awareness.doc().transact_mut();
+        self.handle_sync_step2_by(awareness, update, None)
+    }
+
+    /// As [Protocol::handle_sync_step2], attributing the write to `author`.
+    ///
+    /// `author` becomes the transaction's yrs origin, which update observers read
+    /// back through `TransactionMut::origin()`. Deletions are only attributable
+    /// here: once an item is gone the surviving document holds no record of who
+    /// removed it, so an observer that needs to name the actor has to learn it
+    /// from the transaction that applied the removal.
+    fn handle_sync_step2_by(
+        &self,
+        awareness: &mut Awareness,
+        update: Update,
+        author: Option<&str>,
+    ) -> Result<Option<Message>, Error> {
+        let mut txn = match author {
+            Some(author) => awareness.doc().transact_mut_with(author.to_string()),
+            None => awareness.doc().transact_mut(),
+        };
         txn.apply_update(update)?;
         block_filemeta_path_traversal(&mut txn);
         Ok(None)
@@ -159,6 +178,16 @@ pub trait Protocol {
         update: Update,
     ) -> Result<Option<Message>, Error> {
         self.handle_sync_step2(awareness, update)
+    }
+
+    /// As [Protocol::handle_update], attributing the write to `author`.
+    fn handle_update_by(
+        &self,
+        awareness: &mut Awareness,
+        update: Update,
+        author: Option<&str>,
+    ) -> Result<Option<Message>, Error> {
+        self.handle_sync_step2_by(awareness, update, author)
     }
 
     /// Handle authorization message. By default, if reason for auth denial has been provided,
