@@ -7,8 +7,7 @@
 //! `users` map from each connection's authenticated identity, and an update
 //! names the clients it came from.
 //!
-//! Two traps in reading those client ids, both of which fail by reporting no
-//! author rather than a wrong one:
+//! Three traps in reading those client ids:
 //!
 //! 1. Use `Update::state_vector_lower`, never `state_vector`. The latter is an
 //!    upper bound over blocks contiguous from clock 0, so it drops any client
@@ -16,8 +15,19 @@
 //!    update after a client's first. It looks correct against a freshly-created
 //!    test doc and returns empty for most real traffic.
 //! 2. Insertions and deletions live in different places. A deletion creates no
-//!    blocks, so a delete-only update has an empty state vector by any measure
-//!    and is attributable only through `delete_set`.
+//!    blocks, so a delete-only update has an empty state vector by any measure;
+//!    its delete set is the only client information it carries.
+//! 3. Delete-set client ids name the owners of the *deleted* blocks - whoever
+//!    wrote what was removed - never the client doing the removing. A pure
+//!    deletion carries no authorship at all, so the deleting client is
+//!    unknowable from the update. Attributing the delete-set owner as the actor
+//!    misattributes every removal of someone else's entry: one person's 16-file
+//!    cleanup sweep was logged as three different users, each the entry's last
+//!    writer (observed 2026-08-14).
+//!
+//! Trap 3 is why actors and deleted-entry owners are separate lookups here:
+//! `user_for_update` names the actor and reports none for pure deletions,
+//! while `deleted_entries_user` names whose entries were removed.
 
 use std::collections::{HashMap, HashSet};
 use yrs::updates::decoder::Decode;
@@ -51,29 +61,31 @@ fn _user_by_client<T: ReadTxn>(txn: &T) -> HashMap<u64, String> {
     result
 }
 
-/// Every client that contributed to `update`, whether by inserting or deleting.
-fn _clients_in(update: &Update) -> HashSet<u64> {
+/// Clients that wrote new blocks in `update`: the actors behind it.
+fn _insert_clients(update: &Update) -> HashSet<u64> {
     update
         .state_vector_lower()
         .iter()
         .map(|(client_id, _)| client_id.get())
-        .chain(
-            update
-                .delete_set()
-                .iter()
-                .map(|(client_id, _)| client_id.get()),
-        )
         .collect()
 }
 
-/// The user behind `update`, resolved through the doc's PUD map.
+/// Owners of the blocks `update` deletes. NOT the deleting client (trap 3).
+fn _deleted_block_clients(update: &Update) -> HashSet<u64> {
+    update
+        .delete_set()
+        .iter()
+        .map(|(client_id, _)| client_id.get())
+        .collect()
+}
+
+/// The single user behind `clients`, or None.
 ///
-/// Returns None when the update names no client we have an identity for, which
-/// covers server-authored updates and clients that connected before their user
-/// was registered. Multiple distinct users means a merged update that no single
-/// person authored, so it reports none rather than picking one arbitrarily.
-pub fn user_for_update<T: ReadTxn>(txn: &T, update: &[u8]) -> Option<String> {
-    let clients = _clients_in(&Update::decode_v1(update).ok()?);
+/// None covers clients with no registered identity (server-authored updates,
+/// connections that predate their PUD registration) and multiple distinct
+/// users, which means a merged update that no single person authored - report
+/// none rather than picking one arbitrarily.
+fn _single_user<T: ReadTxn>(txn: &T, clients: &HashSet<u64>) -> Option<String> {
     let by_client = _user_by_client(txn);
 
     let users: HashSet<&String> = clients
@@ -87,34 +99,68 @@ pub fn user_for_update<T: ReadTxn>(txn: &T, update: &[u8]) -> Option<String> {
     }
 }
 
-/// The yjs client ids an update came from, ascending.
+/// The user whose client authored `update`, resolved through the doc's PUD map.
+///
+/// Only new blocks name their author, so a pure deletion resolves to None:
+/// the update genuinely does not say who deleted (trap 3). A move (remove +
+/// insert in one transaction) still attributes, through its inserted block.
+pub fn user_for_update<T: ReadTxn>(txn: &T, update: &[u8]) -> Option<String> {
+    _single_user(txn, &_insert_clients(&Update::decode_v1(update).ok()?))
+}
+
+/// The user whose entries/content `update` deletes - the owner of what was
+/// removed, not the remover.
+pub fn deleted_entries_user<T: ReadTxn>(txn: &T, update: &[u8]) -> Option<String> {
+    _single_user(txn, &_deleted_block_clients(&Update::decode_v1(update).ok()?))
+}
+
+/// The yjs client ids that authored `update`'s new blocks, ascending.
 pub fn clients_in_update(update: &[u8]) -> Vec<u64> {
     let Ok(decoded) = Update::decode_v1(update) else {
         return Vec::new();
     };
 
-    let mut ids: Vec<u64> = _clients_in(&decoded).into_iter().collect();
+    let mut ids: Vec<u64> = _insert_clients(&decoded).into_iter().collect();
     ids.sort_unstable();
     ids
 }
 
-/// True when every client in the update is server-authored (53-bit yrs id,
-/// >= 2^32). PUD registration writes are the main case: the server mutates
-/// the doc's `users` map under its own client id, which fires
-/// `observe_update_v1` and would otherwise produce a webhook for internal
-/// bookkeeping that no human produced.
+/// True when every client named by the update - block authors and deleted-block
+/// owners alike - is server-authored (53-bit yrs id, >= 2^32). PUD registration
+/// writes are the main case: the server mutates the doc's `users` map under its
+/// own client id, which fires `observe_update_v1` and would otherwise produce a
+/// webhook for internal bookkeeping that no human produced.
 pub fn is_server_only_update(update: &[u8]) -> bool {
     let Ok(decoded) = Update::decode_v1(update) else {
         return false;
     };
 
-    let ids = _clients_in(&decoded);
+    let ids: HashSet<u64> = _insert_clients(&decoded)
+        .into_iter()
+        .chain(_deleted_block_clients(&decoded))
+        .collect();
     !ids.is_empty() && ids.iter().all(|id| *id >= (1u64 << 32))
 }
 
-/// The same client ids, comma-separated, or "-" when the update names none.
+/// `clients_in_update`, comma-separated, or "-" when the update names none.
 pub fn clients_for_update(update: &[u8]) -> String {
-    let ids = clients_in_update(update);
+    _render_clients(clients_in_update(update))
+}
+
+/// The owners of `update`'s deleted blocks, comma-separated, or "-" when it
+/// deletes nothing. Also the honest signal that an actorless update was a
+/// deletion rather than server bookkeeping.
+pub fn deleted_clients_for_update(update: &[u8]) -> String {
+    let Ok(decoded) = Update::decode_v1(update) else {
+        return "-".to_string();
+    };
+
+    let mut ids: Vec<u64> = _deleted_block_clients(&decoded).into_iter().collect();
+    ids.sort_unstable();
+    _render_clients(ids)
+}
+
+fn _render_clients(ids: Vec<u64>) -> String {
     if ids.is_empty() {
         return "-".to_string();
     }
@@ -126,14 +172,26 @@ pub fn clients_for_update(update: &[u8]) -> String {
 /// carries. Update callbacks fire while the edited doc's awareness lock is held
 /// as a writer, so the live doc is not readable from there.
 pub fn user_from_snapshot(snapshot: &[u8], update: &[u8]) -> Option<String> {
+    let doc = _doc_from(snapshot)?;
+    let txn = doc.transact();
+    user_for_update(&txn, update)
+}
+
+/// `deleted_entries_user`, resolved from the event's snapshot like
+/// `user_from_snapshot`.
+pub fn deleted_user_from_snapshot(snapshot: &[u8], update: &[u8]) -> Option<String> {
+    let doc = _doc_from(snapshot)?;
+    let txn = doc.transact();
+    deleted_entries_user(&txn, update)
+}
+
+fn _doc_from(snapshot: &[u8]) -> Option<yrs::Doc> {
     let doc = yrs::Doc::new();
     {
         let mut txn = doc.transact_mut();
         txn.apply_update(Update::decode_v1(snapshot).ok()?).ok()?;
     }
-
-    let txn = doc.transact();
-    user_for_update(&txn, update)
+    Some(doc)
 }
 
 #[cfg(test)]
@@ -159,6 +217,19 @@ mod tests {
             body.push(&mut txn, text);
         }
         doc.transact().encode_state_as_update_v1(&before)
+    }
+
+    /// A second doc holding the same state as `a`, with its own client id.
+    fn peer_of(a: &yrs::Doc) -> yrs::Doc {
+        let full = a
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        let b = yrs::Doc::with_client_id(a.client_id().get() + 100);
+        {
+            let mut txn = b.transact_mut();
+            txn.apply_update(Update::decode_v1(&full).unwrap()).unwrap();
+        }
+        b
     }
 
     #[test]
@@ -238,8 +309,12 @@ mod tests {
         assert_eq!(clients_in_update(&update), vec![doc.client_id().get()]);
     }
 
+    /// A membership removal has no actor: deleting creates no blocks, and the
+    /// delete set names the entry's author. Even when deleter == author, the
+    /// update cannot say so, and reporting the author as actor is what logged
+    /// one person's cleanup sweep as three other users (2026-08-14).
     #[test]
-    fn a_map_removal_names_the_client_that_deleted() {
+    fn a_removal_has_no_actor_and_names_the_entry_author_as_deleted() {
         let doc = yrs::Doc::new();
         let map = doc.get_or_insert_map("filemeta_v0");
         {
@@ -252,8 +327,88 @@ mod tests {
             map.remove(&mut txn, "notes/x.md");
         }
         let update = doc.transact().encode_state_as_update_v1(&before);
+        register(&doc, "user-a", &[doc.client_id().get()]);
 
-        assert_eq!(clients_in_update(&update), vec![doc.client_id().get()]);
+        assert_eq!(clients_in_update(&update), Vec::<u64>::new());
+        assert_eq!(user_for_update(&doc.transact(), &update), None);
+        assert_eq!(
+            deleted_clients_for_update(&update),
+            doc.client_id().get().to_string()
+        );
+        assert_eq!(
+            deleted_entries_user(&doc.transact(), &update),
+            Some("user-a".to_string())
+        );
+    }
+
+    /// The production shape behind this module's trap 3: B sweeps an entry A
+    /// created (a zombie cleanup). The update's only client id is A's, so an
+    /// actor reading of the delete set would blame A for B's deletion.
+    #[test]
+    fn removing_anothers_entry_names_them_as_deleted_user_not_actor() {
+        let a = yrs::Doc::new();
+        let map_a = a.get_or_insert_map("filemeta_v0");
+        {
+            let mut txn = a.transact_mut();
+            map_a.insert(&mut txn, "notes/zombie.md", "guid-z");
+        }
+        let b = peer_of(&a);
+
+        let map_b = b.get_or_insert_map("filemeta_v0");
+        let before = b.transact().state_vector();
+        {
+            let mut txn = b.transact_mut();
+            map_b.remove(&mut txn, "notes/zombie.md");
+        }
+        let update = b.transact().encode_state_as_update_v1(&before);
+        register(&b, "user-a", &[a.client_id().get()]);
+        register(&b, "user-b", &[b.client_id().get()]);
+
+        assert_eq!(user_for_update(&b.transact(), &update), None);
+        assert_eq!(
+            deleted_entries_user(&b.transact(), &update),
+            Some("user-a".to_string()),
+            "the delete set names the entry's author, which is exactly why it \
+             must not be reported as the deleter"
+        );
+        assert_eq!(
+            deleted_clients_for_update(&update),
+            a.client_id().get().to_string()
+        );
+    }
+
+    /// A move is remove + insert in one transaction. The inserted block names
+    /// the mover, so moving someone else's entry attributes correctly - it must
+    /// not be swallowed by the two-users-means-none guard.
+    #[test]
+    fn moving_anothers_entry_attributes_the_mover() {
+        let a = yrs::Doc::new();
+        let map_a = a.get_or_insert_map("filemeta_v0");
+        {
+            let mut txn = a.transact_mut();
+            map_a.insert(&mut txn, "notes/old.md", "guid-m");
+        }
+        let b = peer_of(&a);
+
+        let map_b = b.get_or_insert_map("filemeta_v0");
+        let before = b.transact().state_vector();
+        {
+            let mut txn = b.transact_mut();
+            map_b.remove(&mut txn, "notes/old.md");
+            map_b.insert(&mut txn, "notes/new.md", "guid-m");
+        }
+        let update = b.transact().encode_state_as_update_v1(&before);
+        register(&b, "user-a", &[a.client_id().get()]);
+        register(&b, "user-b", &[b.client_id().get()]);
+
+        assert_eq!(
+            user_for_update(&b.transact(), &update),
+            Some("user-b".to_string())
+        );
+        assert_eq!(
+            deleted_entries_user(&b.transact(), &update),
+            Some("user-a".to_string())
+        );
     }
 
     #[test]
@@ -296,6 +451,35 @@ mod tests {
         let user_doc = yrs::Doc::with_client_id(42);
         let user_update = update_from(&user_doc, "human edit");
         assert!(!is_server_only_update(&user_update));
+    }
+
+    /// A server-side deletion of a user's blocks still involves that user's
+    /// ids through the delete set, so it must not be suppressed as server-only.
+    #[test]
+    fn a_server_deletion_of_user_content_is_not_server_only() {
+        let user = yrs::Doc::with_client_id(42);
+        let map_u = user.get_or_insert_map("filemeta_v0");
+        {
+            let mut txn = user.transact_mut();
+            map_u.insert(&mut txn, "notes/x.md", "guid-x");
+        }
+        let full = user
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        let server = yrs::Doc::with_client_id((1u64 << 32) + 1);
+        {
+            let mut txn = server.transact_mut();
+            txn.apply_update(Update::decode_v1(&full).unwrap()).unwrap();
+        }
+        let map_s = server.get_or_insert_map("filemeta_v0");
+        let before = server.transact().state_vector();
+        {
+            let mut txn = server.transact_mut();
+            map_s.remove(&mut txn, "notes/x.md");
+        }
+        let update = server.transact().encode_state_as_update_v1(&before);
+
+        assert!(!is_server_only_update(&update));
     }
 
     #[test]

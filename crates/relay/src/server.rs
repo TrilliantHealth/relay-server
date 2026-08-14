@@ -645,7 +645,27 @@ impl Server {
                                     }
                                     _ => None,
                                 };
-                                let by = by.as_deref().or(event.user.as_deref());
+                                let deleted_by = match (&event.update, &event.snapshot) {
+                                    (Some(update), Some(state)) => {
+                                        edit_author::deleted_user_from_snapshot(state, update)
+                                    }
+                                    _ => None,
+                                };
+                                let deleted_clients = event
+                                    .update
+                                    .as_deref()
+                                    .map(edit_author::deleted_clients_for_update)
+                                    .unwrap_or_else(|| "-".to_string());
+                                // The captured first-load identity is a fair
+                                // stand-in only when nothing was deleted: a
+                                // deletion names no actor, and falling back
+                                // would misattribute it to whoever loaded the
+                                // folder doc first.
+                                let by = by.as_deref().or_else(|| {
+                                    (deleted_clients == "-")
+                                        .then_some(event.user.as_deref())
+                                        .flatten()
+                                });
 
                                 tracing::info!(
                                     added = %delta.added.join(","),
@@ -666,6 +686,17 @@ impl Server {
                                         .as_deref()
                                         .map(edit_author::clients_for_update)
                                         .unwrap_or_else(|| "-".to_string()),
+                                    // Whose entries were removed - the owner of
+                                    // the deleted blocks. yjs records nothing
+                                    // about who removed them, so a removed= line
+                                    // with user=- is attributable no further.
+                                    deleted_name = %deleted_by
+                                        .as_deref()
+                                        .and_then(|id| user_names.get(id))
+                                        .map(String::as_str)
+                                        .unwrap_or("<none>"),
+                                    deleted_user = %deleted_by.as_deref().unwrap_or("-"),
+                                    deleted_clients = %deleted_clients,
                                     channel = %channel,
                                     "Folder membership changed"
                                 );
@@ -682,7 +713,16 @@ impl Server {
                             _ => None,
                         };
 
-                        let user_id = author.as_deref().or(event.user.as_deref());
+                        // Same fallback gate as the membership line: an update
+                        // that deletes anything has no first-load stand-in.
+                        let deletes = event
+                            .update
+                            .as_deref()
+                            .map(edit_author::deleted_clients_for_update)
+                            .is_some_and(|deleted| deleted != "-");
+                        let user_id = author
+                            .as_deref()
+                            .or_else(|| (!deletes).then_some(event.user.as_deref()).flatten());
                         let update_bytes = event.update.as_ref().map_or(0, Vec::len);
                         let vpath_str = vpath.as_deref().unwrap_or("-");
 
@@ -2095,7 +2135,7 @@ async fn handle_file_upload_url(
     TypedHeader(host): TypedHeader<headers::Host>,
     auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
 ) -> Result<Json<FileUploadUrlResponse>, AppError> {
-    tracing::info!(doc_id = %doc_id, "Generating file upload URL");
+    tracing::debug!(doc_id = %doc_id, "Generating file upload URL");
 
     // Get token and extract metadata
     let token = get_token_from_header(auth_header);
@@ -2219,7 +2259,7 @@ async fn handle_file_download_url(
     Query(params): Query<FileDownloadQueryParams>,
     auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
 ) -> Result<Json<FileDownloadUrlResponse>, AppError> {
-    tracing::info!(doc_id = %doc_id, hash = ?params.hash, "Generating file download URL");
+    tracing::debug!(doc_id = %doc_id, hash = ?params.hash, "Generating file download URL");
 
     // Get token
     let token = get_token_from_header(auth_header);
