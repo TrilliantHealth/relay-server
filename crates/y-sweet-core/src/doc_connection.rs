@@ -88,6 +88,11 @@ const SYNC_STATUS_MESSAGE: u8 = 102;
 /// targets (mass content reverts) are 5,000+ spans.
 const LARGE_DELETION_CLOCK_SPAN: u32 = 5000;
 
+/// Transaction origin for writes the server makes on its own behalf (PUD
+/// bookkeeping), as opposed to a user's edit. A user id can never collide with
+/// it: relay user ids are alphanumeric, so the colon makes this unambiguous.
+pub const SERVER_ORIGIN: &str = "relay:server";
+
 fn deleted_spans_by_client<T: ReadTxn>(txn: &T) -> std::collections::HashMap<ClientID, u32> {
     txn.snapshot()
         .delete_set
@@ -319,11 +324,12 @@ impl DocConnection {
         self.user_name = Some(user_name);
     }
 
-    fn log_large_deletion(
-        &self,
+    /// Per-client growth in the delete set, largest first: whose content this
+    /// update removed, and how much of it.
+    fn newly_deleted_spans(
         spans_before: &std::collections::HashMap<ClientID, u32>,
         awareness: &Awareness,
-    ) {
+    ) -> Vec<(ClientID, u32)> {
         let mut newly_deleted: Vec<(ClientID, u32)> =
             deleted_spans_by_client(&awareness.doc().transact())
                 .into_iter()
@@ -333,17 +339,23 @@ impl DocConnection {
                     (growth > 0).then_some((client, growth))
                 })
                 .collect();
+        newly_deleted.sort_by_key(|(_, growth)| std::cmp::Reverse(*growth));
+        newly_deleted
+    }
+
+    /// The forensic record of a mass revert. Deliberately quiet: the threshold
+    /// keeps this to whole-file-scale deletions, so it stays greppable as a
+    /// signal rather than tracking ordinary editing.
+    fn log_large_deletion(&self, newly_deleted: &[(ClientID, u32)]) {
         let deleted_clock_span: u32 = newly_deleted.iter().map(|(_, growth)| growth).sum();
         if deleted_clock_span >= LARGE_DELETION_CLOCK_SPAN {
-            newly_deleted.sort_by_key(|(_, growth)| std::cmp::Reverse(*growth));
-            newly_deleted.truncate(10);
             tracing::info!(
                 vpath = %self.vpath.as_deref().unwrap_or("-"),
                 name = %self.user_name.as_deref().unwrap_or("<none>"),
                 user = %self.user.as_deref().unwrap_or("-"),
                 deleted_clock_span,
                 doc_id = %self.doc_id.as_deref().unwrap_or("-"),
-                top_deleted_from = ?newly_deleted,
+                top_deleted_from = ?&newly_deleted[..newly_deleted.len().min(10)],
                 "Update applied a large deletion"
             );
         }
@@ -416,7 +428,9 @@ impl DocConnection {
             }
         }
 
-        let mut txn = doc.transact_mut();
+        // Tagged so observers can tell server bookkeeping apart from a user edit
+        // whose author simply could not be resolved.
+        let mut txn = doc.transact_mut_with(SERVER_ORIGIN.to_string());
 
         let user_map = match users_map.get(&txn, user_id) {
             Some(Out::YMap(m)) => m,
@@ -498,11 +512,16 @@ impl DocConnection {
                         let mut awareness = a.write().unwrap();
                         let sv_before = self.snapshot_sv(&awareness);
                         let ds_before = deleted_spans_by_client(&awareness.doc().transact());
-                        let result =
-                            protocol.handle_sync_step2(&mut awareness, Update::decode_v1(&update)?);
+                        let result = protocol.handle_sync_step2_by(
+                            &mut awareness,
+                            Update::decode_v1(&update)?,
+                            self.user.as_deref(),
+                        );
                         if result.is_ok() {
                             self.register_new_client_ids(&awareness, &sv_before);
-                            self.log_large_deletion(&ds_before, &awareness);
+                            self.log_large_deletion(&Self::newly_deleted_spans(
+                                &ds_before, &awareness,
+                            ));
                         }
                         result
                     } else {
@@ -520,11 +539,16 @@ impl DocConnection {
                         let mut awareness = a.write().unwrap();
                         let sv_before = self.snapshot_sv(&awareness);
                         let ds_before = deleted_spans_by_client(&awareness.doc().transact());
-                        let result =
-                            protocol.handle_update(&mut awareness, Update::decode_v1(&update)?);
+                        let result = protocol.handle_update_by(
+                            &mut awareness,
+                            Update::decode_v1(&update)?,
+                            self.user.as_deref(),
+                        );
                         if result.is_ok() {
                             self.register_new_client_ids(&awareness, &sv_before);
-                            self.log_large_deletion(&ds_before, &awareness);
+                            self.log_large_deletion(&Self::newly_deleted_spans(
+                                &ds_before, &awareness,
+                            ));
                         }
                         result
                     } else {
@@ -1455,6 +1479,131 @@ mod tests {
         assert_eq!(
             deleted_spans_by_client(&doc.transact()).get(&client),
             Some(&300)
+        );
+    }
+
+    /// Apply `update` to a connection carrying `user`, returning the origin each
+    /// resulting update observer saw.
+    fn origins_seen_applying(user: Option<&str>, update: Vec<u8>) -> Vec<Option<String>> {
+        let doc = yrs::Doc::new();
+        doc.get_or_insert_text("contents");
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let _sub = doc
+            .observe_update_v1(move |txn, _| {
+                sink.lock().unwrap().push(
+                    txn.origin()
+                        .map(|o| String::from_utf8_lossy(o.as_ref()).to_string()),
+                );
+            })
+            .unwrap();
+
+        let awareness = Arc::new(RwLock::new(Awareness::new(doc)));
+        let mut connection = DocConnection::new(awareness, Authorization::Full, |_| {});
+        if let Some(user) = user {
+            connection.set_user(user.to_string());
+        }
+        connection
+            .handle_msg(&DefaultProtocol, Message::Sync(SyncMessage::Update(update)))
+            .unwrap();
+
+        let origins = seen.lock().unwrap().clone();
+        origins
+    }
+
+    /// A doc update that deletes text an earlier author wrote.
+    fn deletion_update() -> Vec<u8> {
+        use yrs::{Doc, GetString, Text};
+
+        let doc = Doc::new();
+        let text = doc.get_or_insert_text("contents");
+        {
+            let mut txn = doc.transact_mut();
+            text.insert(&mut txn, 0, "  - Hillary Cansler\n  - Chris Hebert\n");
+        }
+        {
+            let mut txn = doc.transact_mut();
+            let needle = "  - Hillary Cansler\n";
+            let at = text.get_string(&txn).find(needle).unwrap() as u32;
+            text.remove_range(&mut txn, at, needle.chars().count() as u32);
+        }
+        let update = doc
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        update
+    }
+
+    #[test]
+    fn test_write_carries_connection_user_as_txn_origin() {
+        let origins = origins_seen_applying(Some("pm5jau6foh1uz0m"), deletion_update());
+        assert_eq!(
+            origins.first(),
+            Some(&Some("pm5jau6foh1uz0m".to_string())),
+            "an update observer must be able to name the user who applied a deletion"
+        );
+    }
+
+    /// Applying a client's first update also registers its client_id in PUD, a
+    /// second write the server makes on its own behalf. It must be marked as the
+    /// server's, so a consumer never mistakes it for an unattributable user edit.
+    #[test]
+    fn test_server_pud_write_is_tagged_as_server_not_user() {
+        let origins = origins_seen_applying(Some("pm5jau6foh1uz0m"), deletion_update());
+        assert_eq!(
+            origins,
+            vec![
+                Some("pm5jau6foh1uz0m".to_string()),
+                Some(SERVER_ORIGIN.to_string()),
+            ],
+            "the user's edit comes first, then the server's own PUD registration"
+        );
+    }
+
+    #[test]
+    fn test_write_without_authenticated_user_has_no_origin() {
+        assert_eq!(
+            origins_seen_applying(None, deletion_update()),
+            vec![None],
+            "an unauthenticated write must not be attributed to anyone"
+        );
+    }
+
+    #[test]
+    fn test_newly_deleted_spans_names_whose_content_went_away() {
+        use yrs::{Doc, GetString, Text};
+
+        // Victim writes, then a second client deletes part of it.
+        let victim = Doc::new();
+        let victim_client = victim.client_id();
+        let text = victim.get_or_insert_text("contents");
+        {
+            let mut txn = victim.transact_mut();
+            text.insert(&mut txn, 0, &"x".repeat(400));
+        }
+        let victim_state = victim
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+
+        let server = Doc::new();
+        server.get_or_insert_text("contents");
+        {
+            let mut txn = server.transact_mut();
+            txn.apply_update(Update::decode_v1(&victim_state).unwrap())
+                .unwrap();
+        }
+        let awareness = Awareness::new(server);
+        let before = deleted_spans_by_client(&awareness.doc().transact());
+        {
+            let mut txn = awareness.doc().transact_mut();
+            let text = txn.get_text("contents").unwrap();
+            assert_eq!(text.get_string(&txn).len(), 400);
+            text.remove_range(&mut txn, 0, 250);
+        }
+
+        assert_eq!(
+            DocConnection::newly_deleted_spans(&before, &awareness),
+            vec![(victim_client, 250)],
+            "the deleted span must be charged to the client that authored the content"
         );
     }
 }
