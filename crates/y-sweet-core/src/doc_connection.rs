@@ -34,6 +34,51 @@ type Callback = Arc<dyn Fn(&[u8]) + 'static>;
 #[cfg(feature = "sync")]
 type Callback = Arc<dyn Fn(&[u8]) + 'static + Send + Sync>;
 
+/// Facts extracted from one awareness entry, before any trust decision.
+/// Everything here except `solo_live` comes from the entry's own state
+/// payload, which is minted by the entry's owner and survives relaying.
+pub struct AwarenessEntryFacts {
+    pub client_id: u64,
+    pub declared_version: Option<String>,
+    pub user_name: Option<String>,
+    pub user_id: Option<String>,
+    pub extra_client_ids: Vec<u64>,
+    pub solo_live: bool,
+}
+
+impl AwarenessEntryFacts {
+    fn from_entry(client_id: u64, json: &str, solo: bool) -> Self {
+        let live = json.trim() != "null";
+        let state = serde_json::from_str::<serde_json::Value>(json).ok();
+        let user = state.as_ref().and_then(|s| s.get("user"));
+        Self {
+            client_id,
+            declared_version: state
+                .as_ref()
+                .and_then(|s| s.get("relayVersion"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            user_name: user
+                .and_then(|u| u.get("name"))
+                .and_then(|n| n.as_str())
+                .map(str::to_string),
+            user_id: user
+                .and_then(|u| u.get("id"))
+                .and_then(|i| i.as_str())
+                .map(str::to_string),
+            extra_client_ids: state
+                .as_ref()
+                .and_then(|s| s.get("relayClientIds"))
+                .and_then(|ids| ids.as_array())
+                .map(|ids| ids.iter().filter_map(|id| id.as_u64()).collect())
+                .unwrap_or_default(),
+            solo_live: solo && live,
+        }
+    }
+}
+
+type ClientVersionCallback = Box<dyn Fn(&AwarenessEntryFacts) + Send + Sync>;
+
 const SYNC_STATUS_MESSAGE: u8 = 102;
 
 pub struct DocConnection {
@@ -63,6 +108,10 @@ pub struct DocConnection {
     /// Authenticated user identity from the connection token.
     /// When set, the server will register new client_ids under this user in the "users" map.
     user: Option<String>,
+
+    doc_id: Option<String>,
+
+    on_client_version: Option<ClientVersionCallback>,
 }
 
 impl DocConnection {
@@ -206,11 +255,13 @@ impl DocConnection {
             authorization,
             callback,
             client_id: OnceLock::new(),
+            on_client_version: None,
             closed,
             event_subscriptions: Arc::new(RwLock::new(HashSet::new())),
             expiration_time,
             sync_kv: None,
             user: None,
+            doc_id: None,
         }
     }
 
@@ -222,6 +273,14 @@ impl DocConnection {
     /// Set the authenticated user identity for server-driven PUD registration.
     pub fn set_user(&mut self, user: String) {
         self.user = Some(user);
+    }
+
+    pub fn set_doc_id(&mut self, doc_id: String) {
+        self.doc_id = Some(doc_id);
+    }
+
+    pub fn set_on_client_version(&mut self, callback: ClientVersionCallback) {
+        self.on_client_version = Some(callback);
     }
 
     /// Snapshot the current state vector's client_ids (for before/after comparison).
@@ -240,11 +299,6 @@ impl DocConnection {
         awareness: &Awareness,
         sv_before: &std::collections::HashSet<ClientID>,
     ) {
-        let user_id = match &self.user {
-            Some(u) => u,
-            None => return,
-        };
-
         let sv_after = awareness.doc().transact().state_vector();
 
         let new_ids: Vec<ClientID> = sv_after
@@ -262,6 +316,10 @@ impl DocConnection {
             return;
         }
 
+        let Some(user_id) = &self.user else {
+            return;
+        };
+
         let doc = awareness.doc();
 
         for client_id in new_ids {
@@ -269,9 +327,7 @@ impl DocConnection {
         }
     }
 
-    /// Register a client_id in the "users" PermanentUserData map on the document.
-    /// Takes a Doc reference directly to avoid re-locking awareness.
-    fn register_pud_client_id_on_doc(doc: &yrs::Doc, user_id: &str, client_id: ClientID) {
+    pub fn register_pud_client_id_on_doc(doc: &yrs::Doc, user_id: &str, client_id: ClientID) {
         // get_or_insert_map takes a write txn internally, call before any read txn.
         let users_map = doc.get_or_insert_map("users");
 
@@ -312,7 +368,7 @@ impl DocConnection {
         }
 
         ids_arr.push_back(&mut txn, yrs::Any::Number(client_id.get() as f64));
-        tracing::info!(
+        tracing::debug!(
             user_id,
             client_id = client_id.get(),
             "Registered client_id for user via server-driven PUD"
@@ -417,11 +473,31 @@ impl DocConnection {
                 protocol.handle_awareness_query(&awareness)
             }
             Message::Awareness(update) => {
+                let solo = update.clients.len() == 1;
+                let facts: Vec<AwarenessEntryFacts> = update
+                    .clients
+                    .iter()
+                    .map(|(client_id, entry)| {
+                        AwarenessEntryFacts::from_entry(client_id.get(), &entry.json, solo)
+                    })
+                    .collect();
+                if let Some(callback) = &self.on_client_version {
+                    for entry_facts in &facts {
+                        callback(entry_facts);
+                    }
+                }
+                // PUD registration from payload user.id was here but caused a
+                // sync regression: the write lock + transact_mut per awareness
+                // message serialized against the sync path on reconnect. The
+                // cid upgrade path already registers declaring clients in PUD
+                // outside the message loop; delivery-time registration covers
+                // legacy clients. The awareness path was defense-in-depth only.
                 if update.clients.len() == 1 {
                     let client_id = update.clients.keys().next().unwrap();
                     self.client_id.get_or_init(|| *client_id);
                 } else {
-                    tracing::warn!(
+                    tracing::debug!(
+                        doc_id = ?self.doc_id,
                         user = ?self.user,
                         connection_client_id = ?self.client_id.get(),
                         update_client_ids = ?update.clients.keys().collect::<Vec<_>>(),

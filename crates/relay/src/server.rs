@@ -1,4 +1,6 @@
+use crate::client_versions::{self, ClientVersions};
 use crate::doc_lifecycle::{AttachGuard, AttachKind, DocRegistry, LifecycleConfig};
+use crate::edit_author;
 use anyhow::{anyhow, Result};
 use axum::{
     body::Bytes,
@@ -22,7 +24,12 @@ use futures::{Sink, SinkExt, Stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{io::Write, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    io::Write,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 use tempfile::NamedTempFile;
 use tokio::{
     net::TcpListener,
@@ -58,6 +65,8 @@ const PING_EVERY: Duration = Duration::from_secs(20);
 /// would-be keepalive reap. Observe-only: the connection is never closed for
 /// this; the metric exists to measure whether enforcement would be safe.
 const PONG_TIMEOUT: Duration = Duration::from_secs(40);
+
+const DENIAL_LOG_INTERVAL: Duration = Duration::from_secs(1800);
 
 #[derive(Clone, Debug)]
 pub struct AllowedHost {
@@ -238,6 +247,17 @@ pub struct Server {
     event_dispatcher: Option<Arc<dyn EventDispatcher>>,
     sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
     metrics: Arc<RelayMetrics>,
+    allowed_client_versions: HashSet<String>,
+    denial_log_throttle: Mutex<HashMap<String, DenialLogState>>,
+    client_versions: Arc<ClientVersions>,
+}
+
+type ClientVersionRecorder =
+    Arc<dyn Fn(&y_sweet_core::doc_connection::AwarenessEntryFacts) + Send + Sync>;
+
+struct DenialLogState {
+    last_logged: Instant,
+    suppressed: u64,
 }
 
 impl Server {
@@ -308,7 +328,89 @@ impl Server {
             event_dispatcher,
             sync_protocol_event_sender,
             metrics,
+            allowed_client_versions: HashSet::new(),
+            denial_log_throttle: Mutex::new(HashMap::new()),
+            client_versions: Arc::new(ClientVersions::new()),
         })
+    }
+
+    pub fn with_allowed_client_versions(
+        mut self,
+        versions: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.allowed_client_versions = versions.into_iter().collect();
+        if !self.allowed_client_versions.is_empty() {
+            tracing::warn!(
+                "Requiring client version in {:?} for doc websocket access",
+                self.allowed_client_versions
+            );
+        }
+        self
+    }
+
+    fn denial_log_permit(&self, user: &str) -> Option<u64> {
+        let mut throttle = self.denial_log_throttle.lock().unwrap();
+        match throttle.get_mut(user) {
+            Some(state) if state.last_logged.elapsed() < DENIAL_LOG_INTERVAL => {
+                state.suppressed += 1;
+                None
+            }
+            Some(state) => {
+                let suppressed = state.suppressed;
+                state.last_logged = Instant::now();
+                state.suppressed = 0;
+                Some(suppressed)
+            }
+            None => {
+                throttle.insert(
+                    user.to_string(),
+                    DenialLogState {
+                        last_logged: Instant::now(),
+                        suppressed: 0,
+                    },
+                );
+                Some(0)
+            }
+        }
+    }
+
+    fn check_client_version(
+        &self,
+        user: Option<&str>,
+        version: Option<&str>,
+    ) -> Result<(), AppError> {
+        let Some(user) = user else {
+            return Ok(());
+        };
+        if self.allowed_client_versions.is_empty() {
+            return Ok(());
+        }
+
+        match version {
+            Some(v) if self.allowed_client_versions.contains(v) => Ok(()),
+            _ => {
+                if let Some(suppressed) = self.denial_log_permit(user) {
+                    tracing::warn!(
+                        user = %user,
+                        version = %version.unwrap_or("none"),
+                        allowed = %self
+                            .allowed_client_versions
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        suppressed,
+                        interval_secs = DENIAL_LOG_INTERVAL.as_secs(),
+                        "Blocked user on client version"
+                    );
+                }
+                Err(AppError::auth(
+                    StatusCode::FORBIDDEN,
+                    anyhow!("This plugin version is temporarily blocked from sync; run witchdoctor to upgrade"),
+                    "client_version_blocked",
+                ))
+            }
+        }
     }
 
     /// Close every doc WebSocket: each socket loop breaks, sends its
@@ -486,23 +588,22 @@ impl Server {
                         }
                     }
 
-                    // Log the full event payload as JSON after user assignment
-                    match serde_json::to_string(&event) {
-                        Ok(json_str) => {
-                            tracing::info!("Document updated event dispatched: {}", json_str);
-                        }
-                        Err(e) => {
-                            tracing::info!(
-                                "Document updated event dispatched for doc_id: {} (JSON serialization failed: {})",
-                                event.doc_id, e
-                            );
-                        }
+                    // PUD registration and payload-driven PUD writes mutate
+                    // the doc under the server's own 53-bit client id. These
+                    // fire observe_update_v1 like any edit, but are internal
+                    // bookkeeping - not human-produced content changes.
+                    if event
+                        .update
+                        .as_deref()
+                        .is_some_and(edit_author::is_server_only_update)
+                    {
+                        let envelope =
+                            EventEnvelope::new(routing_channel_for_callback.clone(), event);
+                        dispatcher.send_event(envelope);
+                        return;
                     }
 
-                    // Step 1: Create the envelope with predetermined routing channel
                     let envelope = EventEnvelope::new(routing_channel_for_callback.clone(), event);
-
-                    // Step 2: Send via dispatcher
                     dispatcher.send_event(envelope);
                 }) as y_sweet_core::webhook::WebhookCallback)
             } else {
@@ -884,6 +985,17 @@ impl Server {
 #[derive(Deserialize)]
 struct HandlerParams {
     token: Option<String>,
+    v: Option<String>,
+    cid: Option<String>,
+}
+
+impl HandlerParams {
+    fn declared_client_ids(&self) -> Vec<u64> {
+        self.cid
+            .as_deref()
+            .map(|cid| cid.split(',').filter_map(|id| id.parse().ok()).collect())
+            .unwrap_or_default()
+    }
 }
 
 async fn get_doc_as_update(
@@ -962,6 +1074,7 @@ async fn update_doc_inner(
     Ok(StatusCode::OK.into_response())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_socket_upgrade_with_channel_and_user(
     ws: WebSocketUpgrade,
     Path(doc_id): Path<String>,
@@ -969,6 +1082,8 @@ async fn handle_socket_upgrade_with_channel_and_user(
     routing_channel: Option<String>,
     user: Option<String>,
     token: Option<String>,
+    version: Option<String>,
+    declared_client_ids: Vec<u64>,
     State(server_state): State<Arc<Server>>,
 ) -> Result<Response, AppError> {
     server_state
@@ -995,15 +1110,63 @@ async fn handle_socket_upgrade_with_channel_and_user(
         .attach_doc(&doc_id, AttachKind::Socket, routing_channel, user)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    // Socket loops watch the doc-close token (a child of the server token)
-    // so shutdown can close them ahead of the graceful drain.
     let cancellation_token = server_state.doc_close_token.clone();
     let sync_protocol_event_sender = server_state.sync_protocol_event_sender.clone();
     let metrics = server_state.metrics.clone();
     let doc_id_clone = doc_id.clone();
+    let client_versions = server_state.client_versions.clone();
+    let doc_id_for_recorder = doc_id.clone();
+    for client_id in &declared_client_ids {
+        let client_id = *client_id;
+        let Some(v) = version.as_deref() else { break };
 
-    // The guard moves into the upgrade closure: an abandoned upgrade
-    // detaches via RAII.
+        if let Some(recorded) = client_versions.declare(client_id, v) {
+            tracing::debug!(
+                client_id,
+                version = %recorded.version,
+                previous = %recorded.previous.as_deref().unwrap_or(client_versions::UNKNOWN),
+                doc_id = %doc_id,
+                "Recorded client version"
+            );
+        }
+        if let (Some(user), true) = (user_for_pud.as_deref(), client_id >> 53 == 0) {
+            let awareness = guard.awareness();
+            let awareness = awareness.read().unwrap();
+            y_sweet_core::doc_connection::DocConnection::register_pud_client_id_on_doc(
+                awareness.doc(),
+                user,
+                yrs::block::ClientID::new(client_id),
+            );
+        }
+    }
+    let record_client_version: ClientVersionRecorder = Arc::new(move |facts| {
+        let mut recordings = vec![(
+            facts.client_id,
+            client_versions.observe(client_versions::Observation {
+                client_id: facts.client_id,
+                declared: facts.declared_version.as_deref(),
+                solo_live: facts.solo_live,
+                connection_version: version.as_deref(),
+            }),
+        )];
+        if let Some(declared) = facts.declared_version.as_deref() {
+            recordings.extend(facts.extra_client_ids.iter().map(|extra| {
+                (*extra, client_versions.declare(*extra, declared))
+            }));
+        }
+        for (client_id, recorded) in recordings {
+            let Some(recorded) = recorded else { continue };
+
+            tracing::debug!(
+                client_id,
+                version = %recorded.version,
+                previous = %recorded.previous.as_deref().unwrap_or("-"),
+                doc_id = %doc_id_for_recorder,
+                "Recorded client version"
+            );
+        }
+    });
+
     Ok(ws.on_upgrade(move |socket| {
         handle_socket(
             socket,
@@ -1015,6 +1178,7 @@ async fn handle_socket_upgrade_with_channel_and_user(
             sync_protocol_event_sender,
             doc_id_clone,
             metrics,
+            record_client_version,
         )
     }))
 }
@@ -1088,6 +1252,7 @@ async fn handle_socket_upgrade_deprecated(
     );
     let (authorization, channel, user) =
         verify_socket_token(&server_state, &doc_id, params.token.as_deref())?;
+    server_state.check_client_version(user.as_deref(), params.v.as_deref())?;
 
     handle_socket_upgrade_with_channel_and_user(
         ws,
@@ -1095,7 +1260,9 @@ async fn handle_socket_upgrade_deprecated(
         authorization,
         channel,
         user,
-        params.token.clone(), // Pass the token from query params
+        params.token.clone(),
+        params.v.clone(),
+        params.declared_client_ids(),
         State(server_state),
     )
     .await
@@ -1119,6 +1286,7 @@ async fn handle_socket_upgrade_full_path(
 
     let (authorization, channel, user) =
         verify_socket_token(&server_state, &doc_id, params.token.as_deref())?;
+    server_state.check_client_version(user.as_deref(), params.v.as_deref())?;
 
     handle_socket_upgrade_with_channel_and_user(
         ws,
@@ -1126,12 +1294,15 @@ async fn handle_socket_upgrade_full_path(
         authorization,
         channel,
         user,
-        params.token.clone(), // Pass the token from query params
+        params.token.clone(),
+        params.v.clone(),
+        params.declared_client_ids(),
         State(server_state),
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_socket(
     socket: WebSocket,
     guard: AttachGuard,
@@ -1142,6 +1313,7 @@ async fn handle_socket(
     sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
     doc_id: String,
     metrics: Arc<RelayMetrics>,
+    record_client_version: ClientVersionRecorder,
 ) {
     let (sink, stream) = socket.split();
     handle_socket_inner(
@@ -1155,6 +1327,7 @@ async fn handle_socket(
         sync_protocol_event_sender,
         doc_id,
         metrics,
+        record_client_version,
     )
     .await
 }
@@ -1173,6 +1346,7 @@ async fn handle_socket_inner<S, T, E>(
     sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
     doc_id: String,
     metrics: Arc<RelayMetrics>,
+    record_client_version: ClientVersionRecorder,
 ) where
     S: Sink<Message> + Send + Unpin + 'static,
     T: Stream<Item = Result<Message, E>> + Unpin,
@@ -1248,6 +1422,10 @@ async fn handle_socket_inner<S, T, E>(
         },
     );
     conn.set_sync_kv(sync_kv);
+    conn.set_doc_id(doc_id.clone());
+    conn.set_on_client_version(Box::new(move |facts| {
+        record_client_version(facts);
+    }));
     if let Some(user) = user {
         conn.set_user(user);
     }
@@ -3566,6 +3744,7 @@ mod test {
                 Arc::new(SyncProtocolEventSender::new()),
                 "test_doc".to_string(),
                 metrics.clone(),
+                Arc::new(|_| {}),
             ));
 
             SocketHarness {
