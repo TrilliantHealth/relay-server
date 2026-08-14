@@ -1805,7 +1805,7 @@ async fn handle_socket_inner<S, T, E>(
                 if last_pong.elapsed() > PONG_TIMEOUT && !pong_timed_out {
                     pong_timed_out = true;
                     metrics.record_pong_timeout();
-                    tracing::info!(
+                    tracing::debug!(
                         doc_id = %doc_id,
                         "Pong timeout (observe-only): a keepalive reaper would close this connection"
                     );
