@@ -6,6 +6,10 @@ url = "https://api.example.com"  # RELAY_SERVER_URL
 host = "0.0.0.0"                 # RELAY_SERVER_HOST
 port = 8080                      # PORT
 
+# When non-empty, doc websocket connections must report one of these plugin
+# versions (via the `v` query param). Older clients get 403. Empty = no gate.
+# allowed_client_versions = ["0.9.0"]
+
 [metrics]
 port = 9090                      # METRICS_PORT
 
