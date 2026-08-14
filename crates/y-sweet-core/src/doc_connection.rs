@@ -312,7 +312,7 @@ impl DocConnection {
         }
 
         ids_arr.push_back(&mut txn, yrs::Any::Number(client_id.get() as f64));
-        tracing::info!(
+        tracing::debug!(
             user_id,
             client_id = client_id.get(),
             "Registered client_id for user via server-driven PUD"
@@ -421,7 +421,11 @@ impl DocConnection {
                     let client_id = update.clients.keys().next().unwrap();
                     self.client_id.get_or_init(|| *client_id);
                 } else {
-                    tracing::warn!(
+                    // A relaying client forwards awareness for its peers, so a
+                    // multi-client update is ordinary protocol traffic. It only
+                    // matters here because the single-client case is the one
+                    // this connection can attribute a client_id from.
+                    tracing::debug!(
                         user = ?self.user,
                         connection_client_id = ?self.client_id.get(),
                         update_client_ids = ?update.clients.keys().collect::<Vec<_>>(),
