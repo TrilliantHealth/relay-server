@@ -20,5 +20,9 @@ strip = true     # Strip symbols
 
 [patch.crates-io]
 rusty-s3 = { git = "https://github.com/dtkav/rusty-s3", branch = "main" }
-yrs = { git = "https://github.com/dtkav/y-crdt", rev = "4adcaa62a251bfde5f0ae9b11148413d78d60cd0" }
+# yrs 0.26.0 plus two patches not on crates.io:
+# 1. delete-set-loss when updates arrive out of causal order (dtkav/y-crdt@4adcaa6)
+# 2. find_index divide-by-zero panic in diff_range when a client's whole stream
+#    is one single-unit block (petergaultney/y-crdt thds/0.26.0-patched)
+yrs = { git = "https://github.com/petergaultney/y-crdt", rev = "4996719" }
 yrs-kvstore = { path = "yrs-kvstore" }
