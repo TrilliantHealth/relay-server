@@ -881,7 +881,7 @@ impl Server {
                 let routing_channel = routing_channel.clone();
                 let user = user.clone();
                 async move {
-                    tracing::info!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc");
+                    tracing::debug!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc");
                     self.build_doc(doc_id, routing_channel, user).await
                 }
             })
@@ -905,7 +905,7 @@ impl Server {
                 let routing_channel = routing_channel.clone();
                 let user = user.clone();
                 async move {
-                    tracing::info!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc");
+                    tracing::debug!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc");
                     self.build_doc(doc_id, routing_channel, user).await
                 }
             })
