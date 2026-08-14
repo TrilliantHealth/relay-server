@@ -1401,13 +1401,27 @@ async fn handle_socket_inner<S, T, E>(
     };
 
     metrics.record_websocket_close(close_reason);
-    tracing::info!(
-        doc_id = %doc_id,
-        user = ?log_user,
-        close_reason,
-        duration_secs = connected_at.elapsed().as_secs(),
-        "WebSocket disconnected"
-    );
+    // Sub-second sessions are the sync bots' per-doc open/sync/close, thousands
+    // per reconnect storm. Only a connection that actually lived is a lifecycle
+    // event worth reading at info.
+    let duration_secs = connected_at.elapsed().as_secs();
+    if duration_secs > 0 {
+        tracing::info!(
+            doc_id = %doc_id,
+            user = ?log_user,
+            close_reason,
+            duration_secs,
+            "WebSocket disconnected"
+        );
+    } else {
+        tracing::debug!(
+            doc_id = %doc_id,
+            user = ?log_user,
+            close_reason,
+            duration_secs,
+            "WebSocket disconnected"
+        );
+    }
 
     // Teardown is pure RAII: dropping the guard detaches this connection
     // from the doc's lifecycle actor, and if it was the last one, the
