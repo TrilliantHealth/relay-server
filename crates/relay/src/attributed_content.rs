@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use serde::Serialize;
 use yrs::types::text::YChange;
 use yrs::updates::decoder::Decode;
-use yrs::{Array, GetString, Map, Out, ReadTxn, Snapshot, StateVector, Text, Transact, Update};
+use yrs::{GetString, Out, ReadTxn, Snapshot, StateVector, Text, Transact, Update};
 
 #[derive(Serialize, Debug, PartialEq)]
 pub struct AttributedSpan {
@@ -26,33 +26,9 @@ pub struct AttributedContent {
     pub spans: Vec<AttributedSpan>,
 }
 
-/// Reverse the PUD "users" map (user -> {ids: [client_id]}) into client -> user.
-pub fn user_by_client<T: ReadTxn>(txn: &T) -> HashMap<u64, String> {
-    let mut result = HashMap::new();
-    let Some(users_map) = txn.get_map("users") else {
-        return result;
-    };
-
-    for (user_id, user_val) in users_map.iter(txn) {
-        let Out::YMap(user_map) = user_val else {
-            continue;
-        };
-        let Some(Out::YArray(ids_arr)) = user_map.get(txn, "ids") else {
-            continue;
-        };
-        for item in ids_arr.iter(txn) {
-            let client_id = match item {
-                Out::Any(yrs::Any::Number(n)) => Some(n as u64),
-                Out::Any(yrs::Any::BigInt(n)) => Some(n as u64),
-                _ => None,
-            };
-            if let Some(cid) = client_id {
-                result.insert(cid, user_id.to_string());
-            }
-        }
-    }
-    result
-}
+// Lives in y-sweet-core beside the code that writes the map it reads, so the
+// sync layer can resolve client ids without depending on this crate.
+pub use y_sweet_core::permanent_user_data::user_by_client;
 
 fn _attributed_spans(
     doc: &yrs::Doc,
@@ -145,7 +121,7 @@ pub fn attributed_content(doc: &yrs::Doc, root: &str) -> Option<AttributedConten
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yrs::Doc;
+    use yrs::{Array, Doc, Map};
 
     fn sync(from: &Doc, to: &Doc) {
         let sv = to.transact().state_vector();
