@@ -23,6 +23,9 @@ rusty-s3 = { git = "https://github.com/dtkav/rusty-s3", branch = "main" }
 # yrs 0.26.0 plus two patches not on crates.io:
 # 1. delete-set-loss when updates arrive out of causal order (dtkav/y-crdt@4adcaa6)
 # 2. find_index divide-by-zero panic in diff_range when a client's whole stream
-#    is one single-unit block (petergaultney/y-crdt thds/0.26.0-patched)
+#    is one single-unit block (petergaultney/y-crdt thds/0.26.0-patched).
+#    Proposed upstream as y-crdt/y-crdt#645, closed in favour of #647, which
+#    fixes part of the same problem. Drop this pin once a released yrs carries
+#    the fix; attributed_content's catch_unwind is the fallback without it.
 yrs = { git = "https://github.com/petergaultney/y-crdt", rev = "4996719" }
 yrs-kvstore = { path = "yrs-kvstore" }
