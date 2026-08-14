@@ -93,6 +93,13 @@ pub struct DocumentUpdatedEvent {
     /// consumer needs to inspect content without touching the live doc's lock.
     #[serde(skip)]
     pub state: Option<Vec<u8>>,
+    /// Users whose content this update deleted, most removed first, as
+    /// (user, clock units). Empty when the update deleted nothing. Clock units
+    /// count operations rather than characters, so treat them as a ranking, not
+    /// a size. Only the update that performs a deletion can report this: the
+    /// removed items are gone from the document afterwards.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted_from: Vec<(String, u32)>,
 }
 
 impl DocumentUpdatedEvent {
@@ -105,12 +112,19 @@ impl DocumentUpdatedEvent {
             update: None,
             snapshot: None,
             state: None,
+            deleted_from: Vec::new(),
         }
     }
 
     /// Builder method to add user
     pub fn with_user(mut self, user: String) -> Self {
         self.user = Some(user);
+        self
+    }
+
+    /// Builder method to record whose content this update removed.
+    pub fn with_deleted_from(mut self, deleted_from: Vec<(String, u32)>) -> Self {
+        self.deleted_from = deleted_from;
         self
     }
 
