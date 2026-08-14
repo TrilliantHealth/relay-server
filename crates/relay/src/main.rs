@@ -928,7 +928,8 @@ async fn main() -> Result<()> {
                 config.server.doc_gc,
                 webhook_configs,
             )
-            .await?;
+            .await?
+            .with_allowed_client_versions(config.server.allowed_client_versions);
 
             let redact_errors = config.server.redact_errors;
             let server = Arc::new(server);
