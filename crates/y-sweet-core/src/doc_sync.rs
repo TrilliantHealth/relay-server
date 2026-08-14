@@ -64,11 +64,18 @@ impl DocWithSyncKv {
                     // Extract the full snapshot from the transaction (post-update).
                     let snapshot = txn.snapshot().encode_v1();
 
+                    // A yrs Snapshot is a state vector plus delete set - a
+                    // marker, not content - so it cannot be decoded back into a
+                    // readable doc. Consumers that need to read the post-update
+                    // state get the encoded document instead.
+                    let state = txn.encode_state_as_update_v1(&StateVector::default());
+
                     // Create the event payload with business data, metadata, update, and snapshot
                     let event = DocumentUpdatedEvent::new(doc_key.clone())
                         .with_metadata(&sync_kv)
                         .with_update(event.update.to_vec())
-                        .with_snapshot(snapshot);
+                        .with_snapshot(snapshot)
+                        .with_state(state);
 
                     // Callback handles envelope creation and dispatch
                     callback(event);

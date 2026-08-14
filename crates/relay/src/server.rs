@@ -636,16 +636,16 @@ impl Server {
                         };
 
                         if editing_folder_doc {
-                            if let Some(delta) = event.snapshot.as_deref().and_then(|state| {
+                            if let Some(delta) = event.state.as_deref().and_then(|state| {
                                 vpath_index.sync_membership_from_snapshot(channel, state)
                             }) {
-                                let by = match (&event.update, &event.snapshot) {
+                                let by = match (&event.update, &event.state) {
                                     (Some(update), Some(state)) => {
                                         edit_author::user_from_snapshot(state, update)
                                     }
                                     _ => None,
                                 };
-                                let deleted_by = match (&event.update, &event.snapshot) {
+                                let deleted_by = match (&event.update, &event.state) {
                                     (Some(update), Some(state)) => {
                                         edit_author::deleted_user_from_snapshot(state, update)
                                     }
@@ -706,7 +706,7 @@ impl Server {
                         let vpath = folder
                             .and_then(|folder| vpath_index.resolve(channel, &folder, edited_doc_id));
 
-                        let author = match (&event.update, &event.snapshot) {
+                        let author = match (&event.update, &event.state) {
                             (Some(update), Some(state)) => {
                                 edit_author::user_from_snapshot(state, update)
                             }
