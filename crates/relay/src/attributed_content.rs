@@ -235,12 +235,12 @@ mod tests {
         assert_eq!(content.spans[0].client_id, Some(doc.client_id().get()));
     }
 
-    /// A client whose whole stream is one single-unit block triggers a panic
-    /// in yrs 0.26's find_index (clock / 0) when splitting at the current
-    /// snapshot. The catch_unwind fallback returns the full text as one
-    /// unattributed span rather than crashing.
+    /// A client whose whole stream is one single-unit block used to panic
+    /// yrs 0.26's find_index (clock / 0) when splitting at the current
+    /// snapshot. Our patched yrs branch fixes that, so this attributes
+    /// correctly rather than hitting the catch_unwind fallback.
     #[test]
-    fn test_single_unit_stream_falls_back_gracefully() {
+    fn test_single_unit_stream_attributes_correctly() {
         let doc = Doc::new();
         let text = doc.get_or_insert_text("contents");
         {
@@ -250,5 +250,6 @@ mod tests {
         let content = attributed_content(&doc, "contents").unwrap();
         assert_eq!(content.spans.len(), 1);
         assert_eq!(content.spans[0].text, "x");
+        assert_eq!(content.spans[0].client_id, Some(doc.client_id().get()));
     }
 }
