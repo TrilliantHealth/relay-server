@@ -81,6 +81,26 @@ type ClientVersionCallback = Box<dyn Fn(&AwarenessEntryFacts) + Send + Sync>;
 
 const SYNC_STATUS_MESSAGE: u8 = 102;
 
+/// An incoming update that grows the doc's delete set by at least this many
+/// clock units is logged. Clock units count operations, not characters - a
+/// character edited multiple times accumulates many clock units, so a small
+/// text deletion can produce a span in the hundreds. The forensic cases this
+/// targets (mass content reverts) are 5,000+ spans.
+const LARGE_DELETION_CLOCK_SPAN: u32 = 5000;
+
+fn deleted_spans_by_client<T: ReadTxn>(txn: &T) -> std::collections::HashMap<ClientID, u32> {
+    txn.snapshot()
+        .delete_set
+        .iter()
+        .map(|(client, ranges)| {
+            (
+                *client,
+                ranges.into_iter().map(|r| r.end - r.start).sum::<u32>(),
+            )
+        })
+        .collect()
+}
+
 pub struct DocConnection {
     awareness: Arc<RwLock<Awareness>>,
     #[allow(unused)] // acts as RAII guard
@@ -111,7 +131,13 @@ pub struct DocConnection {
 
     doc_id: Option<String>,
 
+    /// The doc's path within its shared folder, for log context only.
+    vpath: Option<String>,
+
     on_client_version: Option<ClientVersionCallback>,
+
+    /// Display name for `user`, for log context only.
+    user_name: Option<String>,
 }
 
 impl DocConnection {
@@ -262,6 +288,8 @@ impl DocConnection {
             sync_kv: None,
             user: None,
             doc_id: None,
+            vpath: None,
+            user_name: None,
         }
     }
 
@@ -281,6 +309,44 @@ impl DocConnection {
 
     pub fn set_on_client_version(&mut self, callback: ClientVersionCallback) {
         self.on_client_version = Some(callback);
+    }
+
+    pub fn set_vpath(&mut self, vpath: String) {
+        self.vpath = Some(vpath);
+    }
+
+    pub fn set_user_name(&mut self, user_name: String) {
+        self.user_name = Some(user_name);
+    }
+
+    fn log_large_deletion(
+        &self,
+        spans_before: &std::collections::HashMap<ClientID, u32>,
+        awareness: &Awareness,
+    ) {
+        let mut newly_deleted: Vec<(ClientID, u32)> =
+            deleted_spans_by_client(&awareness.doc().transact())
+                .into_iter()
+                .filter_map(|(client, span)| {
+                    let growth =
+                        span.saturating_sub(spans_before.get(&client).copied().unwrap_or(0));
+                    (growth > 0).then_some((client, growth))
+                })
+                .collect();
+        let deleted_clock_span: u32 = newly_deleted.iter().map(|(_, growth)| growth).sum();
+        if deleted_clock_span >= LARGE_DELETION_CLOCK_SPAN {
+            newly_deleted.sort_by_key(|(_, growth)| std::cmp::Reverse(*growth));
+            newly_deleted.truncate(10);
+            tracing::info!(
+                vpath = %self.vpath.as_deref().unwrap_or("-"),
+                name = %self.user_name.as_deref().unwrap_or("<none>"),
+                user = %self.user.as_deref().unwrap_or("-"),
+                deleted_clock_span,
+                doc_id = %self.doc_id.as_deref().unwrap_or("-"),
+                top_deleted_from = ?newly_deleted,
+                "Update applied a large deletion"
+            );
+        }
     }
 
     /// Snapshot the current state vector's client_ids (for before/after comparison).
@@ -431,10 +497,12 @@ impl DocConnection {
                     if can_write {
                         let mut awareness = a.write().unwrap();
                         let sv_before = self.snapshot_sv(&awareness);
+                        let ds_before = deleted_spans_by_client(&awareness.doc().transact());
                         let result =
                             protocol.handle_sync_step2(&mut awareness, Update::decode_v1(&update)?);
                         if result.is_ok() {
                             self.register_new_client_ids(&awareness, &sv_before);
+                            self.log_large_deletion(&ds_before, &awareness);
                         }
                         result
                     } else {
@@ -451,10 +519,12 @@ impl DocConnection {
                     if can_write {
                         let mut awareness = a.write().unwrap();
                         let sv_before = self.snapshot_sv(&awareness);
+                        let ds_before = deleted_spans_by_client(&awareness.doc().transact());
                         let result =
                             protocol.handle_update(&mut awareness, Update::decode_v1(&update)?);
                         if result.is_ok() {
                             self.register_new_client_ids(&awareness, &sv_before);
+                            self.log_large_deletion(&ds_before, &awareness);
                         }
                         result
                     } else {
@@ -1347,5 +1417,40 @@ mod tests {
         let result = connection.handle_msg(&DefaultProtocol, update);
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_deleted_spans_by_client_growth_measures_removed_text() {
+        use yrs::{Doc, GetString, Text};
+
+        let doc = Doc::new();
+        let client = doc.client_id();
+        let text = doc.get_or_insert_text("t");
+        {
+            let mut txn = doc.transact_mut();
+            text.insert(&mut txn, 0, &"x".repeat(500));
+        }
+        let before = deleted_spans_by_client(&doc.transact());
+        assert_eq!(before.get(&client), None);
+        {
+            let mut txn = doc.transact_mut();
+            text.remove_range(&mut txn, 0, 300);
+            assert_eq!(text.get_string(&txn).len(), 200);
+        }
+        let after = deleted_spans_by_client(&doc.transact());
+        assert_eq!(after.get(&client), Some(&300));
+
+        {
+            let full_state = doc
+                .transact()
+                .encode_state_as_update_v1(&yrs::StateVector::default());
+            let mut txn = doc.transact_mut();
+            txn.apply_update(Update::decode_v1(&full_state).unwrap())
+                .unwrap();
+        }
+        assert_eq!(
+            deleted_spans_by_client(&doc.transact()).get(&client),
+            Some(&300)
+        );
     }
 }

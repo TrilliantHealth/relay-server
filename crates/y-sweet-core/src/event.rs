@@ -87,6 +87,12 @@ pub struct DocumentUpdatedEvent {
     pub update: Option<Vec<u8>>,
     #[serde(skip)] // Internal use only: encoded snapshot after this update
     pub snapshot: Option<Vec<u8>>,
+    /// The whole document encoded as an update, post-change. Unlike
+    /// `snapshot` (a yrs Snapshot: state vector + delete set - a marker, not
+    /// content) this can be decoded back into a readable doc, which is what a
+    /// consumer needs to inspect content without touching the live doc's lock.
+    #[serde(skip)]
+    pub state: Option<Vec<u8>>,
 }
 
 impl DocumentUpdatedEvent {
@@ -98,6 +104,7 @@ impl DocumentUpdatedEvent {
             metadata: BTreeMap::new(),
             update: None,
             snapshot: None,
+            state: None,
         }
     }
 
@@ -116,6 +123,12 @@ impl DocumentUpdatedEvent {
     /// Builder method to add encoded Yjs snapshot
     pub fn with_snapshot(mut self, snapshot: Vec<u8>) -> Self {
         self.snapshot = Some(snapshot);
+        self
+    }
+
+    /// Builder method to add the post-update document state
+    pub fn with_state(mut self, state: Vec<u8>) -> Self {
+        self.state = Some(state);
         self
     }
 
