@@ -1192,6 +1192,8 @@ mod tests {
             user: Some("test@example.com".to_string()),
             metadata: Some(serde_json::json!({"version": 2})),
             update: None,
+            writer: None,
+            deleted_from: Vec::new(),
         };
 
         // Send the event
@@ -1238,6 +1240,8 @@ mod tests {
             user: None,
             metadata: None,
             update: None,
+            writer: None,
+            deleted_from: Vec::new(),
         };
 
         // Send the event - should succeed but not send anything
@@ -1270,6 +1274,8 @@ mod tests {
             user: None,
             metadata: None,
             update: None,
+            writer: None,
+            deleted_from: Vec::new(),
         };
 
         let cbor_data = event.to_cbor().unwrap();

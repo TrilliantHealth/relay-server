@@ -925,6 +925,8 @@ impl SyncProtocolEventSender {
             user,
             metadata,
             update: envelope.event.update.clone(),
+            writer: envelope.event.writer.clone(),
+            deleted_from: envelope.event.deleted_from.clone(),
         })
     }
 }
