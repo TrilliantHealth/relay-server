@@ -81,7 +81,16 @@ fn cbor_value_to_json_value(
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DocumentUpdatedEvent {
     pub doc_id: String,
+    /// Whoever caused this doc to be loaded, captured once at load time and
+    /// reported on every update for the doc's lifetime. A stand-in, not the
+    /// author of this update - prefer `writer`.
     pub user: Option<String>,
+    /// The authenticated connection that applied this update, from the yrs
+    /// origin its transaction was tagged with. Unlike `user` this is per
+    /// update, and it is the only identity available for a deletion: the
+    /// removed blocks record nothing about who removed them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer: Option<String>,
     pub metadata: BTreeMap<String, serde_json::Value>,
     #[serde(skip)] // Don't serialize the raw update data to JSON
     pub update: Option<Vec<u8>>,
@@ -108,6 +117,7 @@ impl DocumentUpdatedEvent {
         Self {
             doc_id,
             user: None,
+            writer: None,
             metadata: BTreeMap::new(),
             update: None,
             snapshot: None,
@@ -119,6 +129,12 @@ impl DocumentUpdatedEvent {
     /// Builder method to add user
     pub fn with_user(mut self, user: String) -> Self {
         self.user = Some(user);
+        self
+    }
+
+    /// Builder method to record the connection that applied this update.
+    pub fn with_writer(mut self, writer: String) -> Self {
+        self.writer = Some(writer);
         self
     }
 
@@ -1395,5 +1411,44 @@ mod tests {
                 "subdocs index must not leak into event payloads"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod writer_vs_user_tests {
+    use super::*;
+
+    /// `user` is captured once when a doc loads, so it names whoever caused the
+    /// load - not the author of any later update. `writer` is per update. They
+    /// must stay separate: collapsing them is what made a deletion look like it
+    /// came from whoever opened the doc first.
+    #[test]
+    fn test_writer_and_user_are_independent() {
+        let event = DocumentUpdatedEvent::new("doc".to_string())
+            .with_user("first-loader".to_string())
+            .with_writer("actual-deleter".to_string());
+
+        assert_eq!(event.user.as_deref(), Some("first-loader"));
+        assert_eq!(event.writer.as_deref(), Some("actual-deleter"));
+    }
+
+    #[test]
+    fn test_writer_reaches_the_webhook_payload() {
+        let event = DocumentUpdatedEvent::new("doc".to_string())
+            .with_writer("actual-deleter".to_string())
+            .with_deleted_from(vec![("victim".to_string(), 20)]);
+        let payload: WebhookPayload = EventEnvelope::new("chan".to_string(), event).into();
+
+        assert_eq!(payload.payload["writer"], "actual-deleter");
+        assert_eq!(payload.payload["deleted_from"][0][0], "victim");
+    }
+
+    /// A doc that never had an authenticated writer must not invent one.
+    #[test]
+    fn test_absent_writer_is_omitted_entirely() {
+        let event = DocumentUpdatedEvent::new("doc".to_string());
+        let payload: WebhookPayload = EventEnvelope::new("chan".to_string(), event).into();
+
+        assert!(payload.payload.get("writer").is_none());
     }
 }
