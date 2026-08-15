@@ -111,7 +111,7 @@ impl DocWithSyncKv {
                     if let Some(author) = txn.origin() {
                         match std::str::from_utf8(author.as_ref()) {
                             Ok(user) if user != crate::doc_connection::SERVER_ORIGIN => {
-                                event = event.with_user(user.to_string());
+                                event = event.with_writer(user.to_string());
                             }
                             _ => {}
                         }

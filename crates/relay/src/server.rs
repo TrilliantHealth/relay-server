@@ -660,8 +660,10 @@ impl Server {
                                 // stand-in only when nothing was deleted: a
                                 // deletion names no actor, and falling back
                                 // would misattribute it to whoever loaded the
-                                // folder doc first.
-                                let by = by.as_deref().or_else(|| {
+                                // folder doc first. `writer` is not a stand-in
+                                // - it is the connection that applied this
+                                // update - so it is trusted even for deletions.
+                                let by = event.writer.as_deref().or(by.as_deref()).or_else(|| {
                                     (deleted_clients == "-")
                                         .then_some(event.user.as_deref())
                                         .flatten()
@@ -716,13 +718,18 @@ impl Server {
 
                         // Same fallback gate as the membership line: an update
                         // that deletes anything has no first-load stand-in.
+                        // `writer` is exempt - it names the connection that
+                        // applied this update, so it is right for a deletion,
+                        // which is the one case nothing else can attribute.
                         let deletes = event
                             .update
                             .as_deref()
                             .map(edit_author::deleted_clients_for_update)
                             .is_some_and(|deleted| deleted != "-");
-                        let user_id = author
+                        let user_id = event
+                            .writer
                             .as_deref()
+                            .or(author.as_deref())
                             .or_else(|| (!deletes).then_some(event.user.as_deref()).flatten());
                         let update_bytes = event.update.as_ref().map_or(0, Vec::len);
                         let vpath_str = vpath.as_deref().unwrap_or("-");
