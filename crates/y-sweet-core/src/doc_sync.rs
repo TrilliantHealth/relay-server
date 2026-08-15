@@ -993,3 +993,97 @@ mod deleted_from_tests {
         assert!(captured.read().unwrap().is_empty());
     }
 }
+
+#[cfg(test)]
+mod multi_victim_tests {
+    use super::*;
+    use yrs::{Doc, GetString, Map, MapPrelim, Text};
+
+    fn register(doc: &Doc, user: &str, client: u64) {
+        let users = doc.get_or_insert_map("users");
+        let mut txn = doc.transact_mut();
+        let entry = match users.get(&txn, user) {
+            Some(Out::YMap(m)) => m,
+            _ => users.insert(&mut txn, user, MapPrelim::default()),
+        };
+        let ids = match entry.get(&txn, "ids") {
+            Some(Out::YArray(a)) => a,
+            _ => entry.insert(&mut txn, "ids", yrs::ArrayPrelim::default()),
+        };
+        ids.push_back(&mut txn, yrs::Any::Number(client as f64));
+    }
+
+    /// A single removal can span several people's blocks. All of them are
+    /// reported, ranked by how much of each person's content went, so a
+    /// consumer naming one victim names the person who lost the most.
+    #[test]
+    fn test_three_victims_are_all_reported_in_rank_order() {
+        let doc = Doc::new();
+        doc.get_or_insert_text("contents");
+
+        // three contributors, different amounts, appended in turn
+        for (i, (user, chunk)) in [
+            ("u-ada", "a".repeat(10)),
+            ("u-bob", "b".repeat(30)),
+            ("u-cara", "c".repeat(20)),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let contributor = Doc::with_client_id(200 + i as u64);
+            contributor.get_or_insert_text("contents");
+            {
+                let mut txn = contributor.transact_mut();
+                txn.apply_update(
+                    Update::decode_v1(
+                        &doc.transact()
+                            .encode_state_as_update_v1(&StateVector::default()),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                let t = txn.get_text("contents").unwrap();
+                let at = t.get_string(&txn).chars().count() as u32;
+                t.insert(&mut txn, at, chunk);
+            }
+            let update = contributor
+                .transact()
+                .encode_state_as_update_v1(&doc.transact().state_vector());
+            {
+                let mut txn = doc.transact_mut();
+                txn.apply_update(Update::decode_v1(&update).unwrap())
+                    .unwrap();
+            }
+            register(&doc, user, 200 + i as u64);
+        }
+
+        let captured = Arc::new(RwLock::new(Vec::new()));
+        let sink = captured.clone();
+        let _sub = doc
+            .observe_update_v1(move |txn, _| {
+                let found = deleted_from_users(txn);
+                if !found.is_empty() {
+                    *sink.write().unwrap() = found;
+                }
+            })
+            .unwrap();
+
+        // remove a span crossing all three contributors' blocks
+        {
+            let mut txn = doc.transact_mut();
+            let t = txn.get_text("contents").unwrap();
+            t.remove_range(&mut txn, 0, 60);
+        }
+
+        let victims = captured.read().unwrap().clone();
+        assert_eq!(
+            victims,
+            vec![
+                ("u-bob".to_string(), 30),
+                ("u-cara".to_string(), 20),
+                ("u-ada".to_string(), 10),
+            ],
+            "every victim reported, most-deleted first"
+        );
+    }
+}
