@@ -1883,12 +1883,14 @@ async fn handle_socket_inner<S, T, E>(
     };
 
     metrics.record_websocket_close(close_reason);
-    // Sub-second sessions are the sync bots' per-doc open/sync/close, thousands
-    // per reconnect storm. Only a connection that actually lived is a lifecycle
-    // event worth reading at info.
+    // Clients cycle a websocket per open document every minute or two, so a
+    // clean close is background noise - measured at ~190 per 10 minutes across
+    // 25 docs, which drowned everything else in the log. Only a close the
+    // client did not ask for says anything an operator would act on; the rest
+    // is available at debug and in the close metric.
     let duration_secs = connected_at.elapsed().as_secs();
-    if duration_secs > 0 {
-        tracing::info!(
+    if close_reason == "close_frame" {
+        tracing::debug!(
             doc_id = %doc_id,
             user = ?log_user,
             close_reason,
@@ -1896,7 +1898,7 @@ async fn handle_socket_inner<S, T, E>(
             "WebSocket disconnected"
         );
     } else {
-        tracing::debug!(
+        tracing::info!(
             doc_id = %doc_id,
             user = ?log_user,
             close_reason,
