@@ -585,6 +585,12 @@ pub struct DebouncedSyncProtocolEventSender {
 struct UserEventQueue {
     pending_updates: Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>,
     base_event: Arc<tokio::sync::Mutex<Option<EventEnvelope>>>,
+    /// Attribution accumulated across the debounce window. The base event is
+    /// whichever arrived first, so anything that only some updates carry has to
+    /// be collected here or it is lost when they are merged - a deletion
+    /// following an insertion inside one window being the case that matters.
+    pending_writer: Arc<tokio::sync::Mutex<Option<String>>>,
+    pending_deleted_from: Arc<tokio::sync::Mutex<Vec<(String, u32)>>>,
     last_sent: Arc<tokio::sync::Mutex<Option<tokio::time::Instant>>>,
     debounce_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
@@ -594,6 +600,8 @@ impl UserEventQueue {
         Self {
             pending_updates: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             base_event: Arc::new(tokio::sync::Mutex::new(None)),
+            pending_writer: Arc::new(tokio::sync::Mutex::new(None)),
+            pending_deleted_from: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             last_sent: Arc::new(tokio::sync::Mutex::new(None)),
             debounce_handle: Arc::new(tokio::sync::Mutex::new(None)),
         }
@@ -711,6 +719,22 @@ impl DebouncedSyncProtocolEventSender {
                 let mut pending_updates = queue.pending_updates.lock().await;
                 pending_updates.push(update);
             }
+
+            // Carry attribution forward even when this event is not the base:
+            // a window that begins with an insertion and ends with a deletion
+            // would otherwise report the insertion's (absent) attribution.
+            if let Some(writer) = envelope.event.writer.as_ref() {
+                *queue.pending_writer.lock().await = Some(writer.clone());
+            }
+            if !envelope.event.deleted_from.is_empty() {
+                let mut deleted = queue.pending_deleted_from.lock().await;
+                for (user, span) in &envelope.event.deleted_from {
+                    match deleted.iter_mut().find(|(existing, _)| existing == user) {
+                        Some((_, total)) => *total = total.saturating_add(*span),
+                        None => deleted.push((user.clone(), *span)),
+                    }
+                }
+            }
         }
 
         // Check if we can send immediately (rate limit allows it)
@@ -765,8 +789,22 @@ impl DebouncedSyncProtocolEventSender {
             let mut base_event = queue.base_event.lock().await;
             let mut pending_updates = queue.pending_updates.lock().await;
 
-            let event = base_event.take();
+            let mut event = base_event.take();
             let updates = std::mem::take(&mut *pending_updates);
+
+            // Attribution belongs to whichever update in the window carried it,
+            // not to the one that happened to open the window.
+            let writer = queue.pending_writer.lock().await.take();
+            let deleted_from = std::mem::take(&mut *queue.pending_deleted_from.lock().await);
+            if let Some(event) = event.as_mut() {
+                if writer.is_some() {
+                    event.event.writer = writer;
+                }
+                if !deleted_from.is_empty() {
+                    event.event.deleted_from = deleted_from;
+                }
+            }
+
             (event, updates)
         };
 
@@ -1452,5 +1490,78 @@ mod writer_vs_user_tests {
         let payload: WebhookPayload = EventEnvelope::new("chan".to_string(), event).into();
 
         assert!(payload.payload.get("writer").is_none());
+    }
+}
+
+#[cfg(test)]
+mod debounce_attribution_tests {
+    use super::*;
+
+    fn envelope(writer: Option<&str>, deleted: Vec<(String, u32)>, update: &[u8]) -> EventEnvelope {
+        let mut event = DocumentUpdatedEvent::new("doc-1".to_string()).with_update(update.to_vec());
+        if let Some(w) = writer {
+            event = event.with_writer(w.to_string());
+        }
+        event.deleted_from = deleted;
+        EventEnvelope::new("chan".to_string(), event)
+    }
+
+    /// The window's base event is whichever arrived first, and only its update
+    /// bytes are merged. Typing a line and then deleting one inside the same
+    /// window put the insertion first, so the deletion's attribution was
+    /// dropped - which is why deletions kept committing as the sync bot even
+    /// once the server was resolving the deleter correctly.
+    #[tokio::test]
+    async fn test_a_deletion_after_an_insertion_keeps_its_attribution() {
+        let sender = DebouncedSyncProtocolEventSender::new(
+            Arc::new(SyncProtocolEventSender::new()),
+            RelayMetrics::new_for_test().unwrap(),
+        );
+        let queue = sender.get_or_create_queue("doc-1", None).await;
+
+        // Pretend the window is already open, so neither event sends immediately.
+        *queue.last_sent.lock().await = Some(tokio::time::Instant::now());
+
+        sender.queue_event(envelope(None, vec![], &[1, 2])).await;
+        sender
+            .queue_event(envelope(
+                Some("the-deleter"),
+                vec![("the-victim".to_string(), 20)],
+                &[3, 4],
+            ))
+            .await;
+
+        assert_eq!(
+            queue.pending_writer.lock().await.as_deref(),
+            Some("the-deleter"),
+            "the deleter must survive a window opened by an insertion"
+        );
+        assert_eq!(
+            *queue.pending_deleted_from.lock().await,
+            vec![("the-victim".to_string(), 20)]
+        );
+    }
+
+    /// Two deletions in one window report the total per victim, not only the last.
+    #[tokio::test]
+    async fn test_deletions_in_one_window_accumulate_per_victim() {
+        let sender = DebouncedSyncProtocolEventSender::new(
+            Arc::new(SyncProtocolEventSender::new()),
+            RelayMetrics::new_for_test().unwrap(),
+        );
+        let queue = sender.get_or_create_queue("doc-1", None).await;
+        *queue.last_sent.lock().await = Some(tokio::time::Instant::now());
+
+        sender
+            .queue_event(envelope(Some("d"), vec![("victim".to_string(), 20)], &[1]))
+            .await;
+        sender
+            .queue_event(envelope(Some("d"), vec![("victim".to_string(), 5)], &[2]))
+            .await;
+
+        assert_eq!(
+            *queue.pending_deleted_from.lock().await,
+            vec![("victim".to_string(), 25)]
+        );
     }
 }
