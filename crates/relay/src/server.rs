@@ -1403,11 +1403,13 @@ async fn handle_socket_inner<S, T, E>(
     metrics.record_websocket_close(close_reason);
     // Clients cycle a websocket per open document every minute or two, so a
     // clean close is background noise - measured at ~190 per 10 minutes across
-    // 25 docs, which drowned everything else in the log. Only a close the
-    // client did not ask for says anything an operator would act on; the rest
-    // is available at debug and in the close metric.
+    // 25 docs, which drowned everything else in the log. A stream that just
+    // ends is the same churn seen from the other side: the client went away
+    // without a close handshake, which the reconnect handles. Neither says
+    // anything an operator would act on; both stay available at debug and in
+    // the close metric. token_expired, sink_error and server_shutdown do.
     let duration_secs = connected_at.elapsed().as_secs();
-    if close_reason == "close_frame" {
+    if close_reason == "close_frame" || close_reason == "stream_eof" {
         tracing::debug!(
             doc_id = %doc_id,
             user = ?log_user,
