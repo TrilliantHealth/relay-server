@@ -163,6 +163,17 @@ pub fn deleted_clients_for_update(update: &[u8]) -> String {
     _render_clients(ids)
 }
 
+/// True when `update` removes anything.
+///
+/// An update that deletes carries no recoverable actor (trap 3), which is what
+/// makes a captured-identity fallback unsafe there rather than merely
+/// imprecise: it would name the wrong person for every removal.
+pub fn update_deletes(update: &[u8]) -> bool {
+    Update::decode_v1(update)
+        .map(|decoded| !_deleted_block_clients(&decoded).is_empty())
+        .unwrap_or(false)
+}
+
 fn _render_clients(ids: Vec<u64>) -> String {
     if ids.is_empty() {
         return "-".to_string();

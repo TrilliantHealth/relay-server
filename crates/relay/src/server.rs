@@ -451,9 +451,20 @@ impl Server {
 
             if let Some(dispatcher) = event_dispatcher {
                 Some(Arc::new(move |mut event: DocumentUpdatedEvent| {
-                    // Add user to event if available
-                    if let Some(ref user) = user_for_callback {
-                        event.user = Some(user.clone());
+                    // The doc's update observer already resolved the editing
+                    // user from the update itself. The identity captured when
+                    // this doc was first loaded is only a stand-in for updates
+                    // that name no author, and only when nothing was deleted:
+                    // a deletion names no actor at all, so falling back there
+                    // would pin one person's removal on whoever happened to
+                    // load the doc first. See `edit_author`'s trap 3.
+                    if event.user.is_none()
+                        && !event
+                            .update
+                            .as_deref()
+                            .is_some_and(y_sweet_core::edit_author::update_deletes)
+                    {
+                        event.user = user_for_callback.clone();
                     }
 
                     // Route this subdoc's snapshot through the parent's
@@ -3186,6 +3197,99 @@ mod test {
             "an unattached doc should age out on the idle deadline"
         );
         assert_eq!(server.registry.len(), 0, "the slot must be reclaimed");
+    }
+
+    /// Who a document event names.
+    mod event_attribution {
+        use super::*;
+        use crate::test_util::test_server;
+        use std::sync::Mutex;
+        use y_sweet_core::event::{EventDispatcher, EventEnvelope};
+        use y_sweet_core::store::memory::MemoryStore;
+        use yrs::{Map, ReadTxn, Transact};
+
+        #[derive(Default)]
+        struct CapturingDispatcher {
+            envelopes: Mutex<Vec<EventEnvelope>>,
+        }
+
+        impl CapturingDispatcher {
+            fn last_user(&self) -> Option<String> {
+                self.envelopes
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .and_then(|e| e.event.user.clone())
+            }
+        }
+
+        impl EventDispatcher for CapturingDispatcher {
+            fn send_event(&self, envelope: EventEnvelope) {
+                self.envelopes.lock().unwrap().push(envelope);
+            }
+            fn shutdown(&self) {}
+        }
+
+        async fn capturing_server(store: MemoryStore) -> (Arc<Server>, Arc<CapturingDispatcher>) {
+            let mut server = test_server(
+                Some(Box::new(store)),
+                Duration::from_secs(600),
+                false,
+                CancellationToken::new(),
+            )
+            .await;
+            let capture = Arc::new(CapturingDispatcher::default());
+            server.event_dispatcher = Some(capture.clone() as Arc<dyn EventDispatcher>);
+            (Arc::new(server), capture)
+        }
+
+        /// An update authored by a known client id, so a test can register
+        /// that client under a user and assert the attribution.
+        fn update_from_client(client_id: u64, key: &str, value: &str) -> Vec<u8> {
+            let doc = yrs::Doc::with_client_id(client_id);
+            let map = doc.get_or_insert_map("data");
+            {
+                let mut txn = doc.transact_mut();
+                map.insert(&mut txn, key, value);
+            }
+            let update = doc
+                .transact()
+                .encode_state_as_update_v1(&yrs::StateVector::default());
+            update
+        }
+
+        /// The event's user named whoever first loaded the doc, forever. Two
+        /// people on one doc meant every event carried the first one's name.
+        #[tokio::test]
+        async fn an_event_names_the_editing_user_not_the_first_loader() {
+            let store = MemoryStore::new();
+            let (server, capture) = capturing_server(store).await;
+
+            // The first loader is the identity that used to be baked in.
+            let guard = server
+                .attach_doc(
+                    "shared-doc",
+                    AttachKind::Socket,
+                    None,
+                    Some("first-loader".to_string()),
+                )
+                .await
+                .unwrap();
+
+            // A second person edits, with their client registered in PUD the
+            // way a real connection registers it.
+            guard.doc().register_client_id("editor", 4242);
+            guard
+                .doc()
+                .apply_update(&update_from_client(4242, "k", "v"))
+                .unwrap();
+
+            assert_eq!(
+                capture.last_user(),
+                Some("editor".to_string()),
+                "the event must name the client that authored the update"
+            );
+        }
     }
 
     /// Characterization tests for the current document lifecycle. These pin

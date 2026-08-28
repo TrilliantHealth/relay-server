@@ -64,14 +64,21 @@ impl DocWithSyncKv {
                     // Extract the full snapshot from the transaction (post-update).
                     let snapshot = txn.snapshot().encode_v1();
 
+                    // Resolve the author here, where the doc's own transaction is
+                    // in hand. `TransactionMut` is a `ReadTxn`, so the PUD map
+                    // reads straight out of it: no encode of the post-update
+                    // state, and no throwaway doc to decode it back into.
+                    let author = crate::edit_author::user_for_update(txn, &event.update);
+
                     // Create the event payload with business data, metadata, update, and snapshot
-                    let event = DocumentUpdatedEvent::new(doc_key.clone())
+                    let mut doc_event = DocumentUpdatedEvent::new(doc_key.clone())
                         .with_metadata(&sync_kv)
                         .with_update(event.update.to_vec())
                         .with_snapshot(snapshot);
+                    doc_event.user = author;
 
                     // Callback handles envelope creation and dispatch
-                    callback(event);
+                    callback(doc_event);
                 }
             })
             .map_err(|_| anyhow!("Failed to subscribe to updates"))?
