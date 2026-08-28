@@ -820,7 +820,7 @@ async fn get_doc_as_update(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let update = guard.doc().as_update();
-    tracing::debug!("update: {:?}", update);
+    tracing::trace!("update: {:?}", update);
     Ok(update.into_response())
 }
 
@@ -1161,7 +1161,7 @@ async fn handle_socket_inner<S, T, E>(
                     // connection down as soon as it sees the cancelled token,
                     // so this is a brief race, not an error.
                     metrics_clone.record_websocket_send_failure("closed");
-                    tracing::debug!("Dropping outbound message: writer task exited");
+                    tracing::trace!("Dropping outbound message: writer task exited");
                 }
                 Err(TrySendError::Full(_)) => {
                     // A dropped update silently desyncs this client until it

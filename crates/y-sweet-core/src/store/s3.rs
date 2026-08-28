@@ -1043,7 +1043,7 @@ impl Store for S3Store {
         // Set content-type if provided
         if let Some(content_type) = content_type {
             action.headers_mut().insert("content-type", content_type);
-            tracing::debug!("Added content-type: {}", content_type);
+            tracing::trace!("Added content-type: {}", content_type);
         }
 
         // Note: Content-Length is handled at validation time after upload,
@@ -1599,7 +1599,7 @@ impl Store for S3Store {
         // Set content-type if provided
         if let Some(content_type) = content_type {
             action.headers_mut().insert("content-type", content_type);
-            tracing::debug!("Added content-type: {}", content_type);
+            tracing::trace!("Added content-type: {}", content_type);
         }
 
         // Note: Content-Length is handled at validation time after upload,

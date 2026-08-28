@@ -224,7 +224,7 @@ pub trait Protocol {
         _awareness: &Awareness,
         event_data: Vec<u8>,
     ) -> Result<Option<Message>, Error> {
-        tracing::debug!("Received event message with {} bytes", event_data.len());
+        tracing::trace!("Received event message with {} bytes", event_data.len());
         Ok(None)
     }
 

@@ -550,7 +550,7 @@ fn extract_cwt_key_id(token: &str) -> Option<String> {
     let token_bytes = match b64_decode(token) {
         Ok(bytes) => bytes,
         Err(_) => {
-            tracing::trace!("Failed to base64 decode token for key ID extraction");
+            tracing::debug!("Failed to base64 decode token for key ID extraction");
             return None;
         }
     };
@@ -559,7 +559,7 @@ fn extract_cwt_key_id(token: &str) -> Option<String> {
     let cbor_value: ciborium::Value = match ciborium::de::from_reader(&token_bytes[..]) {
         Ok(value) => value,
         Err(_) => {
-            tracing::trace!("Failed to parse token as CBOR for key ID extraction");
+            tracing::debug!("Failed to parse token as CBOR for key ID extraction");
             return None;
         }
     };
@@ -604,7 +604,7 @@ fn extract_cwt_key_id(token: &str) -> Option<String> {
             }
         }
         _ => {
-            tracing::trace!("Token doesn't have recognizable COSE structure for key ID extraction");
+            tracing::debug!("Token doesn't have recognizable COSE structure for key ID extraction");
         }
     }
 
@@ -1553,7 +1553,7 @@ impl Authenticator {
     ) -> Result<Permission, AuthError> {
         use crate::cwt::scope_to_permission;
 
-        tracing::debug!("Starting CWT token verification with specific key");
+        tracing::trace!("Starting CWT token verification with specific key");
 
         let token_bytes = b64_decode(token).map_err(|e| {
             tracing::error!("Base64 decode failed: {}", e);
@@ -1649,7 +1649,7 @@ impl Authenticator {
             Permission::Server => {}
         }
 
-        tracing::debug!("CWT token verification successful");
+        tracing::trace!("CWT token verification successful");
         Ok(permission)
     }
 
@@ -1683,7 +1683,7 @@ impl Authenticator {
                     expected_audience,
                 );
             } else {
-                tracing::debug!(
+                tracing::trace!(
                     "CWT COSE header key ID '{}' not found in configured keys",
                     key_id
                 );
@@ -1735,7 +1735,7 @@ impl Authenticator {
     ) -> Result<(Permission, Option<String>), AuthError> {
         use crate::cwt::scope_to_permission;
 
-        tracing::debug!("Starting CWT token verification with specific key and channel");
+        tracing::trace!("Starting CWT token verification with specific key and channel");
 
         let token_bytes = b64_decode(token).map_err(|e| {
             tracing::error!("Base64 decode failed: {}", e);
@@ -1831,7 +1831,7 @@ impl Authenticator {
             Permission::Server => {}
         }
 
-        tracing::debug!("CWT token verification successful");
+        tracing::trace!("CWT token verification successful");
         Ok((permission, claims.channel))
     }
 

@@ -141,7 +141,7 @@ impl CwtAuthenticator {
         // Default to symmetric for all raw byte inputs
         // This is safer and follows the principle that symmetric keys are more common
         // For ECDSA keys, users should use new_ecdsa_p256() explicitly
-        tracing::debug!(
+        tracing::trace!(
             "Using {}-byte key as symmetric (default for auto-detection)",
             key_bytes.len()
         );
@@ -207,7 +207,7 @@ impl CwtAuthenticator {
             // Assume raw base64 - default to symmetric
             use crate::auth::b64_decode;
             let key_bytes = b64_decode(trimmed).map_err(|_| CwtError::InvalidCose)?;
-            tracing::debug!(
+            tracing::trace!(
                 "Using {}-byte base64 key as symmetric (default for auto-detection)",
                 key_bytes.len()
             );
@@ -246,15 +246,15 @@ impl CwtAuthenticator {
     pub fn create_cwt(&self, claims: CwtClaims) -> Result<Vec<u8>, CwtError> {
         let cose_bytes = match &self.key_material {
             KeyMaterial::Symmetric(_) => {
-                tracing::debug!("Creating COSE_Mac0 token with symmetric key");
+                tracing::trace!("Creating COSE_Mac0 token with symmetric key");
                 self.create_cwt_mac0(claims)?
             }
             KeyMaterial::EcdsaP256Private(_) => {
-                tracing::debug!("Creating COSE_Sign1 token with ECDSA P-256 private key");
+                tracing::trace!("Creating COSE_Sign1 token with ECDSA P-256 private key");
                 self.create_cwt_sign1(claims)?
             }
             KeyMaterial::Ed25519Private(_) => {
-                tracing::debug!("Creating COSE_Sign1 token with Ed25519 private key");
+                tracing::trace!("Creating COSE_Sign1 token with Ed25519 private key");
                 self.create_cwt_sign1(claims)?
             }
             KeyMaterial::EcdsaP256Public(_) | KeyMaterial::Ed25519Public(_) => {
@@ -375,7 +375,7 @@ impl CwtAuthenticator {
         // Step 1: Verify that the CWT is a valid CBOR object
         let cbor_value =
             ciborium::de::from_reader::<ciborium::Value, _>(token_bytes).map_err(|e| {
-                tracing::debug!("Invalid CBOR object: {:?}", e);
+                tracing::trace!("Invalid CBOR object: {:?}", e);
 
                 CwtError::InvalidCbor
             })?;
@@ -388,7 +388,7 @@ impl CwtAuthenticator {
                     // Re-encode the inner value to get bytes without the CWT tag
                     let mut inner_bytes = Vec::new();
                     ciborium::ser::into_writer(inner_value, &mut inner_bytes).map_err(|e| {
-                        tracing::debug!(
+                        tracing::trace!(
                             "Failed to re-encode inner CBOR after removing CWT tag: {:?}",
                             e
                         );
@@ -397,7 +397,7 @@ impl CwtAuthenticator {
 
                     // Parse the inner value to check for COSE tags
                     let inner_cbor = ciborium::de::from_reader(&inner_bytes[..]).map_err(|e| {
-                        tracing::debug!(
+                        tracing::trace!(
                             "Failed to parse inner CBOR after removing CWT tag: {:?}",
                             e
                         );
@@ -411,7 +411,7 @@ impl CwtAuthenticator {
                                 tracing::trace!("Found valid COSE tag {} after CWT tag", inner_tag);
                             }
                             _ => {
-                                tracing::debug!(
+                                tracing::trace!(
                                     "CWT tag not followed by valid COSE tag, found tag {}",
                                     inner_tag
                                 );
@@ -420,13 +420,13 @@ impl CwtAuthenticator {
                         },
                         ciborium::Value::Array(_) => {
                             // Require proper COSE tags even when wrapped in CWT tag 61
-                            tracing::debug!(
+                            tracing::trace!(
                                 "CWT tag contains untagged COSE array - require proper COSE tags"
                             );
                             return Err(CwtError::InvalidCbor);
                         }
                         _ => {
-                            tracing::debug!(
+                            tracing::trace!(
                                 "CWT tag not followed by tagged COSE structure or Array"
                             );
                             return Err(CwtError::InvalidCbor);
@@ -435,7 +435,7 @@ impl CwtAuthenticator {
 
                     (inner_cbor, inner_bytes, true)
                 } else {
-                    tracing::debug!(
+                    tracing::trace!(
                         "Found CBOR tag {} (not CWT tag 61) - CWT tag required",
                         tag_num
                     );
@@ -445,7 +445,7 @@ impl CwtAuthenticator {
             } else {
                 // RFC 8392 Section 7.2 Step 2: If no CWT tag, the object must still have a COSE CBOR tag
                 // RFC 8392 Section 7.2 Step 3: Must be tagged with one of the COSE CBOR tags
-                tracing::debug!(
+                tracing::trace!(
                     "CBOR object has no CWT tag and no COSE tag - invalid CWT format per RFC 8392"
                 );
                 return Err(CwtError::InvalidCbor);
@@ -458,17 +458,17 @@ impl CwtAuthenticator {
                 match cose_tag {
                     17 => {
                         // COSE_Mac0
-                        tracing::debug!("Found COSE_Mac0 tag (17)");
+                        tracing::trace!("Found COSE_Mac0 tag (17)");
                         match &self.key_material {
                             KeyMaterial::Symmetric(_) => {
-                                tracing::debug!("Using symmetric key for COSE_Mac0 verification");
+                                tracing::trace!("Using symmetric key for COSE_Mac0 verification");
 
                                 // Extract the inner array from the tag and re-encode it
                                 if let ciborium::Value::Tag(17, inner_array) = cose_cbor {
                                     let mut inner_bytes = Vec::new();
                                     ciborium::ser::into_writer(&inner_array, &mut inner_bytes)
                                         .map_err(|e| {
-                                            tracing::debug!(
+                                            tracing::trace!(
                                                 "Failed to re-encode inner array: {:?}",
                                                 e
                                             );
@@ -476,7 +476,7 @@ impl CwtAuthenticator {
                                         })?;
                                     self.verify_cwt_mac0(&inner_bytes, expected_audience)
                                 } else {
-                                    tracing::debug!("Unexpected COSE structure");
+                                    tracing::trace!("Unexpected COSE structure");
                                     return Err(CwtError::InvalidCose);
                                 }
                             }
@@ -493,13 +493,13 @@ impl CwtAuthenticator {
                     }
                     18 => {
                         // COSE_Sign1
-                        tracing::debug!("Found COSE_Sign1 tag (18)");
+                        tracing::trace!("Found COSE_Sign1 tag (18)");
                         match &self.key_material {
                             KeyMaterial::EcdsaP256Private(_)
                             | KeyMaterial::EcdsaP256Public(_)
                             | KeyMaterial::Ed25519Private(_)
                             | KeyMaterial::Ed25519Public(_) => {
-                                tracing::debug!("Using asymmetric key for COSE_Sign1 verification");
+                                tracing::trace!("Using asymmetric key for COSE_Sign1 verification");
 
                                 // Extract the inner array from the tag and re-encode it
                                 if let ciborium::Value::Tag(18, inner_array) = cose_cbor {
@@ -533,13 +533,13 @@ impl CwtAuthenticator {
             }
             ciborium::Value::Array(_) => {
                 // Require proper COSE CBOR tags in all cases - untagged arrays are not valid CWTs
-                tracing::debug!(
+                tracing::trace!(
                     "Found untagged COSE array - require proper COSE tags for defensive parsing"
                 );
                 return Err(CwtError::InvalidCbor);
             }
             _ => {
-                tracing::debug!("Expected COSE tag or Array not found");
+                tracing::trace!("Expected COSE tag or Array not found");
                 return Err(CwtError::InvalidCbor);
             }
         }
@@ -559,7 +559,7 @@ impl CwtAuthenticator {
                     // COSE_Sign1 tag - extract the inner content
                     let mut inner_bytes = Vec::new();
                     ciborium::ser::into_writer(&inner_value, &mut inner_bytes).map_err(|e| {
-                        tracing::debug!("Failed to extract inner COSE_Sign1: {:?}", e);
+                        tracing::trace!("Failed to extract inner COSE_Sign1: {:?}", e);
                         CwtError::InvalidCbor
                     })?;
                     inner_bytes
@@ -575,7 +575,7 @@ impl CwtAuthenticator {
         };
 
         let sign1 = coset::CoseSign1::from_slice(&cose_bytes).map_err(|e| {
-            tracing::debug!("Failed to parse COSE_Sign1 structure: {:?}", e);
+            tracing::trace!("Failed to parse COSE_Sign1 structure: {:?}", e);
             CwtError::InvalidCbor
         })?;
 
@@ -686,7 +686,7 @@ impl CwtAuthenticator {
                     // COSE_Mac0 tag - extract the inner content
                     let mut inner_bytes = Vec::new();
                     ciborium::ser::into_writer(&inner_value, &mut inner_bytes).map_err(|e| {
-                        tracing::debug!("Failed to extract inner COSE_Mac0: {:?}", e);
+                        tracing::trace!("Failed to extract inner COSE_Mac0: {:?}", e);
                         CwtError::InvalidCbor
                     })?;
                     inner_bytes
@@ -702,8 +702,8 @@ impl CwtAuthenticator {
         };
 
         let mac0 = coset::CoseMac0::from_slice(&cose_bytes).map_err(|e| {
-            tracing::debug!("Failed to parse COSE_Mac0 structure: {:?}", e);
-            tracing::debug!("COSE_Mac0 parse error: {:?}", e);
+            tracing::trace!("Failed to parse COSE_Mac0 structure: {:?}", e);
+            tracing::trace!("COSE_Mac0 parse error: {:?}", e);
             CwtError::InvalidCbor
         })?;
 

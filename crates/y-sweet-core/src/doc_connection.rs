@@ -328,7 +328,7 @@ impl DocConnection {
         if deleted_clock_span >= LARGE_DELETION_CLOCK_SPAN {
             newly_deleted.sort_by_key(|(_, growth)| std::cmp::Reverse(*growth));
             newly_deleted.truncate(10);
-            tracing::info!(
+            tracing::debug!(
                 doc_id = ?self.doc_id,
                 user = ?self.user,
                 deleted_clock_span,
