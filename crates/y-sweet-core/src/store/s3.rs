@@ -283,7 +283,11 @@ impl S3Store {
         let action = self.bucket.get_object(Some(&*creds), &prefixed_key);
         let url = action.sign_with_time(PRESIGNED_URL_DURATION, &Timestamp::now());
 
-        tracing::debug!("Generated download URL: {}", url);
+        // The signed URL carries X-Amz-Credential, X-Amz-Signature and,
+        // on rotating STS credentials, X-Amz-Security-Token. Logging it
+        // hands a working credential to anyone holding the log, so only
+        // the key it was signed for is recorded.
+        tracing::debug!(key = %prefixed_key, "Generated presigned download URL");
         Ok(Some(url.to_string()))
     }
 
@@ -1056,7 +1060,11 @@ impl Store for S3Store {
 
         // Sign the URL with time
         let url = action.sign_with_time(PRESIGNED_URL_DURATION, &Timestamp::now());
-        tracing::debug!("Generated upload URL: {}", url);
+        // The signed URL carries X-Amz-Credential, X-Amz-Signature and,
+        // on rotating STS credentials, X-Amz-Security-Token. Logging it
+        // hands a working credential to anyone holding the log, so only
+        // the key it was signed for is recorded.
+        tracing::debug!(key = %prefixed_key, "Generated presigned upload URL");
 
         Ok(Some(url.to_string()))
     }
@@ -1084,7 +1092,11 @@ impl Store for S3Store {
         let action = self.bucket.get_object(Some(&*creds), &prefixed_key);
         let url = action.sign_with_time(PRESIGNED_URL_DURATION, &Timestamp::now());
 
-        tracing::debug!("Generated download URL: {}", url);
+        // The signed URL carries X-Amz-Credential, X-Amz-Signature and,
+        // on rotating STS credentials, X-Amz-Security-Token. Logging it
+        // hands a working credential to anyone holding the log, so only
+        // the key it was signed for is recorded.
+        tracing::debug!(key = %prefixed_key, "Generated presigned download URL");
         Ok(Some(url.to_string()))
     }
 }
@@ -1601,7 +1613,11 @@ impl Store for S3Store {
 
         // Sign the URL with time
         let url = action.sign_with_time(PRESIGNED_URL_DURATION, &Timestamp::now());
-        tracing::debug!("Generated upload URL: {}", url);
+        // The signed URL carries X-Amz-Credential, X-Amz-Signature and,
+        // on rotating STS credentials, X-Amz-Security-Token. Logging it
+        // hands a working credential to anyone holding the log, so only
+        // the key it was signed for is recorded.
+        tracing::debug!(key = %prefixed_key, "Generated presigned upload URL");
 
         Ok(Some(url.to_string()))
     }
@@ -1629,7 +1645,11 @@ impl Store for S3Store {
         let action = self.bucket.get_object(Some(&*creds), &prefixed_key);
         let url = action.sign_with_time(PRESIGNED_URL_DURATION, &Timestamp::now());
 
-        tracing::debug!("Generated download URL: {}", url);
+        // The signed URL carries X-Amz-Credential, X-Amz-Signature and,
+        // on rotating STS credentials, X-Amz-Security-Token. Logging it
+        // hands a working credential to anyone holding the log, so only
+        // the key it was signed for is recorded.
+        tracing::debug!(key = %prefixed_key, "Generated presigned download URL");
         Ok(Some(url.to_string()))
     }
 }
