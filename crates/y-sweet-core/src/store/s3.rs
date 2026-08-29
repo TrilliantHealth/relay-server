@@ -5,7 +5,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use jiff::Timestamp;
 use reqwest::{Client, Method, Response, StatusCode, Url};
-use rusty_s3::{Bucket, Credentials, S3Action};
+use rusty_s3::credentials::Ec2SecurityCredentialsMetadataResponse;
+pub use rusty_s3::credentials::RotatingCredentials;
+use rusty_s3::{Bucket, S3Action};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::sync::OnceLock;
@@ -19,6 +21,8 @@ const S3_SESSION_TOKEN: &str = "AWS_SESSION_TOKEN";
 const S3_REGION: &str = "AWS_REGION";
 const S3_ENDPOINT: &str = "AWS_ENDPOINT_URL_S3"; // Using consistent naming across tools
 const S3_USE_PATH_STYLE: &str = "AWS_S3_USE_PATH_STYLE";
+const S3_CREDENTIALS_FILE: &str = "AWS_CREDENTIALS_FILE";
+const S3_PROBE_PREFIX: &str = "STORAGE_PROBE_PREFIX";
 const DEFAULT_S3_REGION: &str = "us-east-1";
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -33,6 +37,15 @@ pub struct S3Config {
 
     // Use old path-style URLs, needed to support some S3-compatible APIs (including some minio setups)
     pub path_style: bool,
+
+    /// When set, initial credentials are loaded from this file (IMDS
+    /// security-credentials JSON) and the relay hot-reloads it. AWS access
+    /// key / secret env vars become optional.
+    pub credentials_file: Option<String>,
+
+    /// Prefix used for the max-keys=0 bucket probe in `init()` when no
+    /// storage prefix is configured (lets prefix-scoped IAM policies pass).
+    pub probe_prefix: Option<String>,
 }
 
 impl S3Config {
@@ -97,19 +110,77 @@ impl S3Config {
         let endpoint = env::var(S3_ENDPOINT)
             .unwrap_or_else(|_| format!("https://s3.dualstack.{}.amazonaws.com", &region));
 
+        let credentials_file = env::var(S3_CREDENTIALS_FILE).ok();
+        let probe_prefix = env::var(S3_PROBE_PREFIX).ok();
+
+        // When a credentials file is configured the wrapper owns the
+        // credentials, so the access-key env vars become optional and the
+        // initial key/secret/token come from the file (fail fast if bad).
+        let (key, secret, token) = if let Some(path) = &credentials_file {
+            let creds = load_credentials_file(path)?;
+            (
+                creds.key().to_string(),
+                creds.secret().to_string(),
+                Some(creds.token().to_string()),
+            )
+        } else {
+            (
+                env::var(S3_ACCESS_KEY_ID)
+                    .map_err(|_| anyhow::anyhow!("{} env var not supplied", S3_ACCESS_KEY_ID))?,
+                env::var(S3_SECRET_ACCESS_KEY).map_err(|_| {
+                    anyhow::anyhow!("{} env var not supplied", S3_SECRET_ACCESS_KEY)
+                })?,
+                env::var(S3_SESSION_TOKEN).ok(),
+            )
+        };
+
         Ok(S3Config {
-            key: env::var(S3_ACCESS_KEY_ID)
-                .map_err(|_| anyhow::anyhow!("{} env var not supplied", S3_ACCESS_KEY_ID))?,
-            secret: env::var(S3_SECRET_ACCESS_KEY)
-                .map_err(|_| anyhow::anyhow!("{} env var not supplied", S3_SECRET_ACCESS_KEY))?,
+            key,
+            secret,
             endpoint,
             region,
-            token: env::var(S3_SESSION_TOKEN).ok(),
+            token,
             bucket,
             bucket_prefix,
             path_style,
+            credentials_file,
+            probe_prefix,
         })
     }
+}
+
+/// Load AWS credentials from a JSON file in the IMDS security-credentials
+/// shape (`AccessKeyId`/`SecretAccessKey`/`Token`/`Expiration`). Used when a
+/// credentials file is configured so the process can start from
+/// wrapper-provided scoped credentials.
+pub fn load_credentials_file(path: &str) -> anyhow::Result<Ec2SecurityCredentialsMetadataResponse> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("failed to read credentials file {}: {}", path, e))?;
+    Ec2SecurityCredentialsMetadataResponse::deserialize(&contents)
+        .map_err(|e| anyhow::anyhow!("failed to parse credentials file {}: {}", path, e))
+}
+
+/// Observable result of re-reading the credentials file: enough to
+/// log/measure a rotation without exposing the secret.
+pub struct ReloadedCredentials {
+    pub key_id: String,
+    pub expiration_unix: i64,
+}
+
+/// Re-read the credentials file and rotate `credentials` in place, returning
+/// the new key id and expiration (unix seconds) for logging and metrics.
+pub fn reload_credentials_file(
+    path: &str,
+    credentials: &RotatingCredentials,
+) -> anyhow::Result<ReloadedCredentials> {
+    let parsed = load_credentials_file(path)?;
+    let key_id = parsed.key().to_string();
+    let expiration_unix = parsed.expiration().as_second();
+    parsed.rotate_credentials(credentials);
+    Ok(ReloadedCredentials {
+        key_id,
+        expiration_unix,
+    })
 }
 
 const PRESIGNED_URL_DURATION: Duration = Duration::from_secs(60 * 60);
@@ -118,8 +189,9 @@ pub struct S3Store {
     pub bucket: Bucket,
     _bucket_checked: OnceLock<()>,
     client: Client,
-    pub credentials: Credentials,
+    pub credentials: RotatingCredentials,
     prefix: Option<String>,
+    probe_prefix: Option<String>,
 }
 
 #[derive(Debug)]
@@ -132,11 +204,7 @@ struct ListObjectsPage {
 
 impl S3Store {
     pub fn new(config: S3Config) -> Self {
-        let credentials = if let Some(token) = config.token {
-            Credentials::new_with_token(config.key, config.secret, token)
-        } else {
-            Credentials::new(config.key, config.secret)
-        };
+        let credentials = RotatingCredentials::new(config.key, config.secret, config.token);
         let endpoint: Url = config.endpoint.parse().expect("endpoint is a valid url");
 
         let path_style = if config.path_style {
@@ -160,7 +228,24 @@ impl S3Store {
             client,
             credentials,
             prefix: config.bucket_prefix,
+            probe_prefix: config.probe_prefix,
         }
+    }
+
+    /// Clone the shared rotating-credentials handle so a background task can
+    /// rotate the credentials this store signs with. Cheap; shares state.
+    pub fn rotating_credentials(&self) -> RotatingCredentials {
+        self.credentials.clone()
+    }
+
+    /// Prefix used for the max-keys=0 bucket probe: the storage prefix wins
+    /// (it is always within policy), else the configured `probe_prefix`, else
+    /// none.
+    fn resolve_probe_prefix<'a>(
+        prefix: Option<&'a str>,
+        probe_prefix: Option<&'a str>,
+    ) -> Option<&'a str> {
+        prefix.or(probe_prefix)
     }
 
     /// Generate a presigned URL for downloading a file from S3 with an optional existence check
@@ -194,9 +279,8 @@ impl S3Store {
             return Ok(None);
         }
 
-        let action = self
-            .bucket
-            .get_object(Some(&self.credentials), &prefixed_key);
+        let creds = self.credentials.get();
+        let action = self.bucket.get_object(Some(&*creds), &prefixed_key);
         let url = action.sign_with_time(PRESIGNED_URL_DURATION, &Timestamp::now());
 
         tracing::debug!("Generated download URL: {}", url);
@@ -451,7 +535,8 @@ impl S3Store {
 
         tracing::debug!("Listing objects with prefix: {}", prefixed);
 
-        let mut action = self.bucket.list_objects_v2(Some(&self.credentials));
+        let creds = self.credentials.get();
+        let mut action = self.bucket.list_objects_v2(Some(&*creds));
         action.with_prefix(prefixed.as_str());
         if let Some(delimiter) = delimiter {
             action.with_delimiter(delimiter);
@@ -536,10 +621,13 @@ impl S3Store {
 
         // Use ListObjectsV2 with max-keys=0 so that prefix-scoped IAM
         // policies (s3:ListBucket with s3:prefix condition) are sufficient.
-        let mut action = self.bucket.list_objects_v2(Some(&self.credentials));
+        let creds = self.credentials.get();
+        let mut action = self.bucket.list_objects_v2(Some(&*creds));
         action.with_max_keys(0);
-        if let Some(prefix) = &self.prefix {
-            action.with_prefix(prefix.as_str());
+        if let Some(prefix) =
+            Self::resolve_probe_prefix(self.prefix.as_deref(), self.probe_prefix.as_deref())
+        {
+            action.with_prefix(prefix);
         }
         let result = self.store_request(Method::GET, action, None).await;
 
@@ -590,9 +678,8 @@ impl S3Store {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         self.init().await?;
         let prefixed_key = self.prefixed_key(key);
-        let object_get = self
-            .bucket
-            .get_object(Some(&self.credentials), &prefixed_key);
+        let creds = self.credentials.get();
+        let object_get = self.bucket.get_object(Some(&*creds), &prefixed_key);
         let response = self.store_request(Method::GET, object_get, None).await;
 
         match response {
@@ -608,9 +695,8 @@ impl S3Store {
     async fn get_with_lease(&self, key: &str) -> Result<LeasedValue> {
         self.init().await?;
         let prefixed_key = self.prefixed_key(key);
-        let object_get = self
-            .bucket
-            .get_object(Some(&self.credentials), &prefixed_key);
+        let creds = self.credentials.get();
+        let object_get = self.bucket.get_object(Some(&*creds), &prefixed_key);
         let response = self.store_request(Method::GET, object_get, None).await;
 
         match response {
@@ -638,9 +724,8 @@ impl S3Store {
         use rusty_s3::S3Action;
         self.init().await?;
         let prefixed_key = self.prefixed_key(key);
-        let mut object_get = self
-            .bucket
-            .get_object(Some(&self.credentials), &prefixed_key);
+        let creds = self.credentials.get();
+        let mut object_get = self.bucket.get_object(Some(&*creds), &prefixed_key);
         // S3 GetObject takes the version via the `versionId` query parameter.
         // rusty-s3 doesn't expose a builder method, but `query_mut()` lets
         // us insert it directly and the signing path picks it up.
@@ -660,9 +745,8 @@ impl S3Store {
     async fn set(&self, key: &str, value: Vec<u8>) -> Result<()> {
         self.init().await?;
         let prefixed_key = self.prefixed_key(key);
-        let action = self
-            .bucket
-            .put_object(Some(&self.credentials), &prefixed_key);
+        let creds = self.credentials.get();
+        let action = self.bucket.put_object(Some(&*creds), &prefixed_key);
         self.store_request(Method::PUT, action, Some(value)).await?;
         Ok(())
     }
@@ -677,9 +761,8 @@ impl S3Store {
             WriteLease::Opaque { backend, token } if backend == "s3-etag" => {
                 self.init().await?;
                 let prefixed_key = self.prefixed_key(key);
-                let mut action = self
-                    .bucket
-                    .put_object(Some(&self.credentials), &prefixed_key);
+                let creds = self.credentials.get();
+                let mut action = self.bucket.put_object(Some(&*creds), &prefixed_key);
                 action.headers_mut().insert("if-match", token.clone());
                 let headers = [("if-match", token.as_str())];
                 let response = self
@@ -695,9 +778,8 @@ impl S3Store {
             WriteLease::Missing => {
                 self.init().await?;
                 let prefixed_key = self.prefixed_key(key);
-                let mut action = self
-                    .bucket
-                    .put_object(Some(&self.credentials), &prefixed_key);
+                let creds = self.credentials.get();
+                let mut action = self.bucket.put_object(Some(&*creds), &prefixed_key);
                 action.headers_mut().insert("if-none-match", "*");
                 let headers = [("if-none-match", "*")];
                 let response = self
@@ -727,9 +809,8 @@ impl S3Store {
     async fn remove(&self, key: &str) -> Result<()> {
         self.init().await?;
         let prefixed_key = self.prefixed_key(key);
-        let action = self
-            .bucket
-            .delete_object(Some(&self.credentials), &prefixed_key);
+        let creds = self.credentials.get();
+        let action = self.bucket.delete_object(Some(&*creds), &prefixed_key);
         self.store_request(Method::DELETE, action, None).await?;
         Ok(())
     }
@@ -737,9 +818,8 @@ impl S3Store {
     async fn exists(&self, key: &str) -> Result<bool> {
         self.init().await?;
         let prefixed_key = self.prefixed_key(key);
-        let action = self
-            .bucket
-            .head_object(Some(&self.credentials), &prefixed_key);
+        let creds = self.credentials.get();
+        let action = self.bucket.head_object(Some(&*creds), &prefixed_key);
         let response = self.store_request(Method::HEAD, action, None).await;
         match response {
             Ok(_) => Ok(true),
@@ -825,7 +905,8 @@ impl Store for S3Store {
             key.to_string()
         };
 
-        let mut action = self.bucket.list_object_versions(Some(&self.credentials));
+        let creds = self.credentials.get();
+        let mut action = self.bucket.list_object_versions(Some(&*creds));
         action.with_prefix(&prefixed_key);
         let url = action.sign_with_time(PRESIGNED_URL_DURATION, &Timestamp::now());
 
@@ -952,9 +1033,8 @@ impl Store for S3Store {
         );
 
         // Create action for presigned PUT request
-        let mut action = self
-            .bucket
-            .put_object(Some(&self.credentials), &prefixed_key);
+        let creds = self.credentials.get();
+        let mut action = self.bucket.put_object(Some(&*creds), &prefixed_key);
 
         // Set content-type if provided
         if let Some(content_type) = content_type {
@@ -1000,9 +1080,8 @@ impl Store for S3Store {
             return Ok(None);
         }
 
-        let action = self
-            .bucket
-            .get_object(Some(&self.credentials), &prefixed_key);
+        let creds = self.credentials.get();
+        let action = self.bucket.get_object(Some(&*creds), &prefixed_key);
         let url = action.sign_with_time(PRESIGNED_URL_DURATION, &Timestamp::now());
 
         tracing::debug!("Generated download URL: {}", url);
@@ -1013,6 +1092,33 @@ impl Store for S3Store {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    /// The credential document the rotating-credentials path parses. Held
+    /// inline rather than in a checked-in fixture so the values sit next to
+    /// the assertions that pin them. The key pair is AWS's own published
+    /// documentation example, not a real credential.
+    const AWS_CREDENTIALS_FIXTURE: &str = r#"{
+  "AccessKeyId": "ASIAIOSFODNN7EXAMPLE",
+  "SecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+  "Token": "IQoJb3JpZ2luX2VjEXAMPLESESSIONTOKEN",
+  "Expiration": "2026-07-06T22:14:00Z"
+}
+"#;
+
+    /// Stands in for the credential file the rotation path reads: writes the
+    /// fixture to a private path and hands back that path. Unique per call,
+    /// so concurrent tests never share a file.
+    fn credentials_file(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "relay_creds_{tag}_{}_{}.json",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, AWS_CREDENTIALS_FIXTURE).unwrap();
+        path
+    }
 
     // Mock the S3Action trait to test the headers_mut functionality
     struct MockS3Action {
@@ -1061,6 +1167,8 @@ mod tests {
             region: "us-east-1".to_string(),
             bucket_prefix: Some("prefix/".to_string()),
             path_style: true,
+            credentials_file: None,
+            probe_prefix: None,
         };
 
         let store = S3Store::new(config);
@@ -1091,6 +1199,8 @@ mod tests {
             region: "us-east-1".to_string(),
             bucket_prefix: Some("prefix".to_string()),
             path_style: true,
+            credentials_file: None,
+            probe_prefix: None,
         };
 
         let store = S3Store::new(config);
@@ -1121,6 +1231,8 @@ mod tests {
             region: "us-east-1".to_string(),
             bucket_prefix: None,
             path_style: true,
+            credentials_file: None,
+            probe_prefix: None,
         };
 
         let store = S3Store::new(config);
@@ -1227,6 +1339,178 @@ mod tests {
         assert_eq!(page.files[0].key, "files/test-doc/abc123");
         assert_eq!(page.files[0].size, 1024);
     }
+
+    // Env vars are process-global; serialize the `from_env` tests behind a
+    // dedicated mutex (mirrors the with_env_vars pattern in config.rs).
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_s3_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], test: F) {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        // Everything `from_env` / `build_config` reads, so each case starts clean.
+        const MANAGED: &[&str] = &[
+            "RELAY_SERVER_STORAGE",
+            "STORAGE_BUCKET",
+            "AWS_S3_BUCKET",
+            "STORAGE_PREFIX",
+            "AWS_S3_BUCKET_PREFIX",
+            "AWS_REGION",
+            "AWS_ENDPOINT_URL_S3",
+            "AWS_S3_USE_PATH_STYLE",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_CREDENTIALS_FILE",
+            "STORAGE_PROBE_PREFIX",
+        ];
+        let saved: Vec<(&str, Option<String>)> = MANAGED
+            .iter()
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect();
+        for k in MANAGED {
+            std::env::remove_var(k);
+        }
+        for (k, v) in vars {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+        test();
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_shared_credentials_vector() {
+        use super::*;
+
+        let parsed =
+            Ec2SecurityCredentialsMetadataResponse::deserialize(AWS_CREDENTIALS_FIXTURE).unwrap();
+        assert_eq!(parsed.key(), "ASIAIOSFODNN7EXAMPLE");
+        assert_eq!(parsed.secret(), "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+        assert_eq!(parsed.token(), "IQoJb3JpZ2luX2VjEXAMPLESESSIONTOKEN");
+        // 2026-07-06T22:14:00Z
+        assert_eq!(parsed.expiration().as_second(), 1783376040);
+    }
+
+    #[test]
+    fn test_load_credentials_file_happy_and_missing() {
+        use super::*;
+
+        let path = credentials_file("happy");
+        let creds = load_credentials_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(creds.key(), "ASIAIOSFODNN7EXAMPLE");
+        std::fs::remove_file(&path).ok();
+
+        let err = load_credentials_file("/nonexistent/aws-credentials.json").unwrap_err();
+        assert!(err.to_string().contains("failed to read credentials file"));
+    }
+
+    #[test]
+    fn test_reload_credentials_file_and_rotation() {
+        use super::*;
+
+        let path = credentials_file("reload");
+
+        let store = S3Store::new(S3Config {
+            key: "OLDKEY".to_string(),
+            endpoint: "http://localhost:9000".to_string(),
+            secret: "oldsecret".to_string(),
+            token: None,
+            bucket: "b".to_string(),
+            region: "us-east-1".to_string(),
+            bucket_prefix: None,
+            path_style: true,
+            credentials_file: None,
+            probe_prefix: None,
+        });
+        let handle = store.rotating_credentials();
+        assert_eq!(handle.get().key(), "OLDKEY");
+
+        let reloaded = reload_credentials_file(path.to_str().unwrap(), &handle).unwrap();
+        assert_eq!(reloaded.key_id, "ASIAIOSFODNN7EXAMPLE");
+        assert_eq!(reloaded.expiration_unix, 1783376040);
+
+        // Rotation is visible through the store's own shared handle.
+        let current = store.credentials.get();
+        assert_eq!(current.key(), "ASIAIOSFODNN7EXAMPLE");
+        assert_eq!(current.secret(), "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+        assert_eq!(current.token(), Some("IQoJb3JpZ2luX2VjEXAMPLESESSIONTOKEN"));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_resolve_probe_prefix() {
+        use super::*;
+
+        // Storage prefix wins even when a probe prefix is set.
+        assert_eq!(
+            S3Store::resolve_probe_prefix(Some("tenant/"), Some("probe/")),
+            Some("tenant/")
+        );
+        // Falls back to the probe prefix when no storage prefix is configured.
+        assert_eq!(
+            S3Store::resolve_probe_prefix(None, Some("probe/")),
+            Some("probe/")
+        );
+        // Neither configured -> unprefixed probe (current behavior).
+        assert_eq!(S3Store::resolve_probe_prefix(None, None), None);
+    }
+
+    #[test]
+    fn test_from_env_credentials_file_matrix() {
+        use super::*;
+
+        let path = credentials_file("from_env");
+        let path_str = path.to_str().unwrap();
+
+        // (a) credentials file present, key/secret absent -> credentials come
+        // from the file and the path is recorded.
+        with_s3_env(&[("AWS_CREDENTIALS_FILE", Some(path_str))], || {
+            let cfg = S3Config::from_env(Some("bucket".to_string()), None).unwrap();
+            assert_eq!(cfg.key, "ASIAIOSFODNN7EXAMPLE");
+            assert_eq!(cfg.secret, "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+            assert_eq!(
+                cfg.token.as_deref(),
+                Some("IQoJb3JpZ2luX2VjEXAMPLESESSIONTOKEN")
+            );
+            assert_eq!(cfg.credentials_file.as_deref(), Some(path_str));
+        });
+
+        // (b) no file and no key/secret -> fails fast.
+        with_s3_env(&[], || {
+            assert!(S3Config::from_env(Some("bucket".to_string()), None).is_err());
+        });
+
+        // (c) credentials file configured but missing on disk -> fail fast.
+        with_s3_env(
+            &[("AWS_CREDENTIALS_FILE", Some("/nonexistent/creds.json"))],
+            || {
+                assert!(S3Config::from_env(Some("bucket".to_string()), None).is_err());
+            },
+        );
+
+        // (d) STORAGE_PROBE_PREFIX is read through into the config.
+        with_s3_env(
+            &[
+                ("AWS_ACCESS_KEY_ID", Some("AKIAEXAMPLE")),
+                ("AWS_SECRET_ACCESS_KEY", Some("secret")),
+                ("STORAGE_PROBE_PREFIX", Some("relay-probe/")),
+            ],
+            || {
+                let cfg = S3Config::from_env(Some("bucket".to_string()), None).unwrap();
+                assert_eq!(cfg.probe_prefix.as_deref(), Some("relay-probe/"));
+                assert_eq!(cfg.key, "AKIAEXAMPLE");
+            },
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1297,9 +1581,8 @@ impl Store for S3Store {
         );
 
         // Create action for presigned PUT request
-        let mut action = self
-            .bucket
-            .put_object(Some(&self.credentials), &prefixed_key);
+        let creds = self.credentials.get();
+        let mut action = self.bucket.put_object(Some(&*creds), &prefixed_key);
 
         // Set content-type if provided
         if let Some(content_type) = content_type {
@@ -1342,9 +1625,8 @@ impl Store for S3Store {
             return Ok(None);
         }
 
-        let action = self
-            .bucket
-            .get_object(Some(&self.credentials), &prefixed_key);
+        let creds = self.credentials.get();
+        let action = self.bucket.get_object(Some(&*creds), &prefixed_key);
         let url = action.sign_with_time(PRESIGNED_URL_DURATION, &Timestamp::now());
 
         tracing::debug!("Generated download URL: {}", url);

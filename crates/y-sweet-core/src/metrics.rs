@@ -25,6 +25,11 @@ pub struct RelayMetrics {
     // Object store metrics
     pub s3_requests_total: CounterVec,
 
+    // Scoped-credential rotation metrics (credentials-file mode)
+    pub credential_rotations_total: CounterVec,
+    pub credential_fallback_active: GaugeVec,
+    pub credential_expiry_timestamp_seconds: GaugeVec,
+
     // WebSocket connection lifecycle metrics
     pub websocket_closes_total: CounterVec,
     pub websocket_pong_timeouts_total: CounterVec,
@@ -178,6 +183,36 @@ impl RelayMetrics {
         )?;
         registry.register(Box::new(s3_requests_total.clone()))?;
 
+        let credential_rotations_total = CounterVec::new(
+            Opts::new(
+                "relay_server_credential_rotations_total",
+                "Credential-file rotations applied to the live S3 store, labeled by outcome",
+            ),
+            &["outcome"],
+        )?;
+        registry.register(Box::new(credential_rotations_total.clone()))?;
+
+        let credential_fallback_active = GaugeVec::new(
+            Opts::new(
+                "relay_server_credential_fallback_active",
+                "1 while the store is running on env-key fallback credentials because the credentials file went stale; 0 on the scoped path. Alert on any nonzero",
+            ),
+            &[],
+        )?;
+        registry.register(Box::new(credential_fallback_active.clone()))?;
+        // Touch so it exports 0 from startup; "never fell back" must be
+        // distinguishable from "no data".
+        credential_fallback_active.with_label_values(&[]);
+
+        let credential_expiry_timestamp_seconds = GaugeVec::new(
+            Opts::new(
+                "relay_server_credential_expiry_timestamp_seconds",
+                "Unix expiration time of the credentials currently loaded from the credentials file. Alert when value - time() drops below the refresh lead",
+            ),
+            &[],
+        )?;
+        registry.register(Box::new(credential_expiry_timestamp_seconds.clone()))?;
+
         // WebSocket connection lifecycle metrics
         let websocket_closes_total = CounterVec::new(
             Opts::new(
@@ -267,6 +302,9 @@ impl RelayMetrics {
             debounced_queue_length,
             http_auth_errors_total,
             s3_requests_total,
+            credential_rotations_total,
+            credential_fallback_active,
+            credential_expiry_timestamp_seconds,
             websocket_closes_total,
             websocket_pong_timeouts_total,
             websocket_pong_recoveries_total,
@@ -371,6 +409,24 @@ impl RelayMetrics {
         self.s3_requests_total
             .with_label_values(&[method, outcome])
             .inc();
+    }
+
+    pub fn record_credential_rotation(&self, outcome: &str) {
+        self.credential_rotations_total
+            .with_label_values(&[outcome])
+            .inc();
+    }
+
+    pub fn set_credential_fallback_active(&self, active: bool) {
+        self.credential_fallback_active
+            .with_label_values(&[])
+            .set(if active { 1.0 } else { 0.0 });
+    }
+
+    pub fn set_credential_expiry(&self, unix_seconds: i64) {
+        self.credential_expiry_timestamp_seconds
+            .with_label_values(&[])
+            .set(unix_seconds as f64);
     }
 
     // WebSocket connection lifecycle metrics methods

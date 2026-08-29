@@ -89,6 +89,8 @@ fn parse_s3_config(env: &Env) -> anyhow::Result<S3Config> {
             .to_string(),
         bucket_prefix: env.var(S3_BUCKET_PREFIX).ok().map(|t| t.to_string()),
         path_style: false,
+        credentials_file: None,
+        probe_prefix: None,
     })
 }
 

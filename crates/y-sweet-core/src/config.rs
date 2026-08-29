@@ -174,6 +174,8 @@ static ENV_OVERRIDES: &[EnvOverride] = &[
                     presigned_url_expiration: default_presigned_url_expiration(),
                     access_key_id: None,
                     secret_access_key: None,
+                    credentials_file: None,
+                    probe_prefix: None,
                 });
             } else {
                 config.store = StoreConfig::Filesystem(FilesystemStoreConfig {
@@ -220,6 +222,10 @@ pub const ADDITIONAL_ENV_VARS: &[&str] = &[
     "AWS_SESSION_TOKEN",
     "AWS_ENDPOINT_URL_S3",
     "AWS_S3_USE_PATH_STYLE",
+    // Scoped-credential rotation (credentials-file mode)
+    "AWS_CREDENTIALS_FILE",
+    "AWS_CREDENTIALS_POLL_SECS",
+    "STORAGE_PROBE_PREFIX",
     // Legacy/alternative storage variables
     "STORAGE_BUCKET",
     "AWS_S3_BUCKET",
@@ -453,6 +459,15 @@ pub struct S3StoreConfig {
 
     pub access_key_id: Option<String>,
     pub secret_access_key: Option<String>,
+
+    /// Load initial credentials from this file (IMDS security-credentials
+    /// JSON) and hot-reload them. Optional; env `AWS_CREDENTIALS_FILE` is the
+    /// fallback. Backwards compatible (absent -> None).
+    pub credentials_file: Option<String>,
+
+    /// Prefix for the max-keys=0 bucket probe in `init()`. Optional; env
+    /// `STORAGE_PROBE_PREFIX` is the fallback.
+    pub probe_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -470,6 +485,12 @@ pub struct AwsStoreConfig {
 
     #[serde(default = "default_presigned_url_expiration")]
     pub presigned_url_expiration: u64,
+
+    /// See [`S3StoreConfig::credentials_file`].
+    pub credentials_file: Option<String>,
+
+    /// See [`S3StoreConfig::probe_prefix`].
+    pub probe_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -625,6 +646,8 @@ impl StoreConfig {
                 prefix: aws.prefix.clone(),
                 access_key_id: aws.access_key_id.clone(),
                 secret_access_key: aws.secret_access_key.clone(),
+                credentials_file: aws.credentials_file.clone(),
+                probe_prefix: aws.probe_prefix.clone(),
             }),
             StoreConfig::Cloudflare(cf) => Some(S3StoreConfig {
                 bucket: cf.bucket.clone(),
@@ -635,6 +658,8 @@ impl StoreConfig {
                 prefix: cf.prefix.clone(),
                 access_key_id: cf.access_key_id.clone(),
                 secret_access_key: cf.secret_access_key.clone(),
+                credentials_file: None,
+                probe_prefix: None,
             }),
             StoreConfig::Backblaze(b2) => Some(S3StoreConfig {
                 bucket: b2.bucket.clone(),
@@ -645,6 +670,8 @@ impl StoreConfig {
                 prefix: b2.prefix.clone(),
                 access_key_id: b2.key_id.clone(),
                 secret_access_key: b2.application_key.clone(),
+                credentials_file: None,
+                probe_prefix: None,
             }),
             StoreConfig::Minio(minio) => Some(S3StoreConfig {
                 bucket: minio.bucket.clone(),
@@ -655,6 +682,8 @@ impl StoreConfig {
                 prefix: minio.prefix.clone(),
                 access_key_id: minio.access_key.clone(),
                 secret_access_key: minio.secret_key.clone(),
+                credentials_file: None,
+                probe_prefix: None,
             }),
             StoreConfig::Tigris(tigris) => Some(S3StoreConfig {
                 bucket: tigris.bucket.clone(),
@@ -665,6 +694,8 @@ impl StoreConfig {
                 prefix: tigris.prefix.clone(),
                 access_key_id: tigris.access_key_id.clone(),
                 secret_access_key: tigris.secret_access_key.clone(),
+                credentials_file: None,
+                probe_prefix: None,
             }),
             _ => None,
         }
@@ -1214,5 +1245,93 @@ public_key = "test-public-key"
         let (key, types) = parse_auth_env_value("abc123base64key==").unwrap();
         assert_eq!(key, "abc123base64key==");
         assert_eq!(types, default_allowed_token_types());
+    }
+
+    #[test]
+    fn test_s3_store_credentials_file_toml_roundtrip() {
+        let toml_str = r#"
+type = "s3"
+bucket = "my-bucket"
+credentials_file = "/dev/shm/aws-credentials.json"
+probe_prefix = "relay-probe/"
+"#;
+        let store: StoreConfig = toml::from_str(toml_str).unwrap();
+        let StoreConfig::S3(s3) = &store else {
+            panic!("expected s3 store, got {:?}", store);
+        };
+        assert_eq!(
+            s3.credentials_file.as_deref(),
+            Some("/dev/shm/aws-credentials.json")
+        );
+        assert_eq!(s3.probe_prefix.as_deref(), Some("relay-probe/"));
+
+        // Round-trips back out and parses to the same values.
+        let reserialized = toml::to_string(&store).unwrap();
+        let store2: StoreConfig = toml::from_str(&reserialized).unwrap();
+        let StoreConfig::S3(s3b) = &store2 else {
+            panic!("expected s3 store after round-trip");
+        };
+        assert_eq!(
+            s3b.credentials_file.as_deref(),
+            Some("/dev/shm/aws-credentials.json")
+        );
+        assert_eq!(s3b.probe_prefix.as_deref(), Some("relay-probe/"));
+    }
+
+    #[test]
+    fn test_aws_store_credentials_file_toml_roundtrip() {
+        let toml_str = r#"
+type = "aws"
+bucket = "my-bucket"
+credentials_file = "/dev/shm/aws-credentials.json"
+probe_prefix = "relay-probe/"
+"#;
+        let store: StoreConfig = toml::from_str(toml_str).unwrap();
+        let StoreConfig::Aws(aws) = &store else {
+            panic!("expected aws store, got {:?}", store);
+        };
+        assert_eq!(
+            aws.credentials_file.as_deref(),
+            Some("/dev/shm/aws-credentials.json")
+        );
+        assert_eq!(aws.probe_prefix.as_deref(), Some("relay-probe/"));
+    }
+
+    #[test]
+    fn test_store_config_omitted_new_fields_backwards_compat() {
+        // Configs written before these fields existed must still parse.
+        let s3: StoreConfig = toml::from_str("type = \"s3\"\nbucket = \"b\"\n").unwrap();
+        let StoreConfig::S3(s3) = &s3 else {
+            panic!("expected s3 store");
+        };
+        assert_eq!(s3.credentials_file, None);
+        assert_eq!(s3.probe_prefix, None);
+
+        let aws: StoreConfig = toml::from_str("type = \"aws\"\nbucket = \"b\"\n").unwrap();
+        let StoreConfig::Aws(aws) = &aws else {
+            panic!("expected aws store");
+        };
+        assert_eq!(aws.credentials_file, None);
+        assert_eq!(aws.probe_prefix, None);
+    }
+
+    #[test]
+    fn test_aws_to_s3_config_propagates_new_fields() {
+        let store = StoreConfig::Aws(AwsStoreConfig {
+            bucket: "b".to_string(),
+            region: default_s3_region(),
+            access_key_id: None,
+            secret_access_key: None,
+            prefix: String::new(),
+            presigned_url_expiration: default_presigned_url_expiration(),
+            credentials_file: Some("/dev/shm/aws-credentials.json".to_string()),
+            probe_prefix: Some("relay-probe/".to_string()),
+        });
+        let s3 = store.to_s3_config().unwrap();
+        assert_eq!(
+            s3.credentials_file.as_deref(),
+            Some("/dev/shm/aws-credentials.json")
+        );
+        assert_eq!(s3.probe_prefix.as_deref(), Some("relay-probe/"));
     }
 }

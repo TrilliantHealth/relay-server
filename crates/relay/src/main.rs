@@ -21,8 +21,11 @@ use url::Url;
 use y_sweet_core::{
     auth::Authenticator,
     config::Config,
+    metrics::RelayMetrics,
     store::{
-        s3::{S3Config, S3Store},
+        s3::{
+            load_credentials_file, reload_credentials_file, RotatingCredentials, S3Config, S3Store,
+        },
         Store,
     },
 };
@@ -433,6 +436,8 @@ fn load_config_for_serve_args(
                 presigned_url_expiration: 3600,
                 access_key_id: None,
                 secret_access_key: None,
+                credentials_file: None,
+                probe_prefix: None,
             });
         } else {
             config.store = StoreConfig::Filesystem(FilesystemStoreConfig {
@@ -497,51 +502,128 @@ fn load_config_for_serve_args(
     Ok(config)
 }
 
+/// A constructed store plus, when the store loads its credentials from a
+/// file, the handle a background task needs to hot-reload them.
+struct BuiltStore {
+    store: Box<dyn Store>,
+    creds_reload: Option<CredentialsReload>,
+}
+
+/// Everything the credentials-reload worker needs: the file to watch, the
+/// shared rotating handle to update, and the legacy env-key fallback used if
+/// the file goes stale.
+struct CredentialsReload {
+    path: String,
+    credentials: RotatingCredentials,
+    fallback: Option<(String, String)>,
+}
+
+/// Build an [`S3Config`] from a resolved `S3StoreConfig`, applying
+/// TOML-then-env fallbacks. When a credentials file resolves, the initial
+/// key/secret/token come from the file (fail fast) and the access-key env
+/// vars are no longer required.
+fn s3_config_from_store(s3_config: &y_sweet_core::config::S3StoreConfig) -> Result<S3Config> {
+    let credentials_file = s3_config
+        .credentials_file
+        .clone()
+        .or_else(|| env::var("AWS_CREDENTIALS_FILE").ok());
+    let probe_prefix = s3_config
+        .probe_prefix
+        .clone()
+        .or_else(|| env::var("STORAGE_PROBE_PREFIX").ok());
+
+    let (key, secret, token) = if let Some(path) = &credentials_file {
+        let creds = load_credentials_file(path)
+            .with_context(|| format!("failed to load AWS credentials file {}", path))?;
+        (
+            creds.key().to_string(),
+            creds.secret().to_string(),
+            Some(creds.token().to_string()),
+        )
+    } else {
+        (
+            s3_config
+                .access_key_id
+                .clone()
+                .or_else(|| env::var("AWS_ACCESS_KEY_ID").ok())
+                .ok_or_else(|| anyhow::anyhow!("AWS_ACCESS_KEY_ID is required"))?,
+            s3_config
+                .secret_access_key
+                .clone()
+                .or_else(|| env::var("AWS_SECRET_ACCESS_KEY").ok())
+                .ok_or_else(|| anyhow::anyhow!("AWS_SECRET_ACCESS_KEY is required"))?,
+            env::var("AWS_SESSION_TOKEN").ok(),
+        )
+    };
+
+    Ok(S3Config {
+        key,
+        secret,
+        token,
+        endpoint: if !s3_config.endpoint.is_empty() {
+            s3_config.endpoint.clone()
+        } else if let Ok(ep) = env::var("AWS_ENDPOINT_URL_S3") {
+            ep
+        } else {
+            format!("https://s3.dualstack.{}.amazonaws.com", s3_config.region)
+        },
+        region: s3_config.region.clone(),
+        bucket: s3_config.bucket.clone(),
+        bucket_prefix: if s3_config.prefix.is_empty() {
+            None
+        } else {
+            Some(s3_config.prefix.clone())
+        },
+        path_style: s3_config.path_style,
+        credentials_file,
+        probe_prefix,
+    })
+}
+
+/// Construct an S3-backed store and, in credentials-file mode, the reload
+/// handle. The env-key fallback is captured only when both
+/// `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are present.
+fn build_s3_store(s3_config: &y_sweet_core::config::S3StoreConfig) -> Result<BuiltStore> {
+    let config = s3_config_from_store(s3_config)?;
+    let credentials_file = config.credentials_file.clone();
+    let store = S3Store::new(config);
+
+    let creds_reload = credentials_file.map(|path| {
+        let fallback = match (
+            env::var("AWS_ACCESS_KEY_ID").ok(),
+            env::var("AWS_SECRET_ACCESS_KEY").ok(),
+        ) {
+            (Some(key), Some(secret)) => Some((key, secret)),
+            _ => None,
+        };
+        CredentialsReload {
+            path,
+            credentials: store.rotating_credentials(),
+            fallback,
+        }
+    });
+
+    Ok(BuiltStore {
+        store: Box::new(store),
+        creds_reload,
+    })
+}
+
 fn get_store_from_config(
     store_config: &y_sweet_core::config::StoreConfig,
-) -> Result<Option<Box<dyn Store>>> {
+) -> Result<Option<BuiltStore>> {
     use y_sweet_core::config::StoreConfig;
 
     match store_config {
         StoreConfig::Memory => Ok(None),
         StoreConfig::Filesystem(fs_config) => {
             let store = FileSystemStore::new(PathBuf::from(&fs_config.path))?;
-            Ok(Some(Box::new(store)))
+            Ok(Some(BuiltStore {
+                store: Box::new(store),
+                creds_reload: None,
+            }))
         }
-        StoreConfig::S3(s3_config) => {
-            // Build S3 configuration from our config
-            let s3_store_config = S3Config {
-                key: s3_config
-                    .access_key_id
-                    .clone()
-                    .or_else(|| env::var("AWS_ACCESS_KEY_ID").ok())
-                    .ok_or_else(|| anyhow::anyhow!("AWS_ACCESS_KEY_ID is required"))?,
-                secret: s3_config
-                    .secret_access_key
-                    .clone()
-                    .or_else(|| env::var("AWS_SECRET_ACCESS_KEY").ok())
-                    .ok_or_else(|| anyhow::anyhow!("AWS_SECRET_ACCESS_KEY is required"))?,
-                token: env::var("AWS_SESSION_TOKEN").ok(),
-                endpoint: if !s3_config.endpoint.is_empty() {
-                    s3_config.endpoint.clone()
-                } else if let Ok(ep) = env::var("AWS_ENDPOINT_URL_S3") {
-                    ep
-                } else {
-                    format!("https://s3.dualstack.{}.amazonaws.com", s3_config.region)
-                },
-                region: s3_config.region.clone(),
-                bucket: s3_config.bucket.clone(),
-                bucket_prefix: if s3_config.prefix.is_empty() {
-                    None
-                } else {
-                    Some(s3_config.prefix.clone())
-                },
-                path_style: s3_config.path_style,
-            };
-
-            let store = S3Store::new(s3_store_config);
-            Ok(Some(Box::new(store)))
-        }
+        StoreConfig::S3(s3_config) => Ok(Some(build_s3_store(s3_config)?)),
         // Convert provider-specific configs to generic S3 config
         StoreConfig::Aws(_)
         | StoreConfig::Cloudflare(_)
@@ -551,39 +633,7 @@ fn get_store_from_config(
             let s3_config = store_config
                 .to_s3_config()
                 .ok_or_else(|| anyhow::anyhow!("Failed to convert provider config to S3 config"))?;
-
-            // Build S3 configuration from our config
-            let s3_store_config = S3Config {
-                key: s3_config
-                    .access_key_id
-                    .clone()
-                    .or_else(|| env::var("AWS_ACCESS_KEY_ID").ok())
-                    .ok_or_else(|| anyhow::anyhow!("AWS_ACCESS_KEY_ID is required"))?,
-                secret: s3_config
-                    .secret_access_key
-                    .clone()
-                    .or_else(|| env::var("AWS_SECRET_ACCESS_KEY").ok())
-                    .ok_or_else(|| anyhow::anyhow!("AWS_SECRET_ACCESS_KEY is required"))?,
-                token: env::var("AWS_SESSION_TOKEN").ok(),
-                endpoint: if !s3_config.endpoint.is_empty() {
-                    s3_config.endpoint.clone()
-                } else if let Ok(ep) = env::var("AWS_ENDPOINT_URL_S3") {
-                    ep
-                } else {
-                    format!("https://s3.dualstack.{}.amazonaws.com", s3_config.region)
-                },
-                region: s3_config.region.clone(),
-                bucket: s3_config.bucket.clone(),
-                bucket_prefix: if s3_config.prefix.is_empty() {
-                    None
-                } else {
-                    Some(s3_config.prefix.clone())
-                },
-                path_style: s3_config.path_style,
-            };
-
-            let store = S3Store::new(s3_store_config);
-            Ok(Some(Box::new(store)))
+            Ok(Some(build_s3_store(&s3_config)?))
         }
     }
 }
@@ -599,12 +649,14 @@ fn build_store_for_subcommand(
         get_store_from_opts(arg)?
     } else {
         let cfg = Config::load(config_path.map(|p| p.as_path()))?;
-        get_store_from_config(&cfg.store)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "configured store is in-memory; this subcommand requires a real store. \
-                 Pass --store s3://... or --config <path> pointing at a config with a store."
-            )
-        })?
+        get_store_from_config(&cfg.store)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "configured store is in-memory; this subcommand requires a real store. \
+                     Pass --store s3://... or --config <path> pointing at a config with a store."
+                )
+            })?
+            .store
     };
     Ok(Arc::new(raw))
 }
@@ -854,22 +906,24 @@ async fn main() -> Result<()> {
             // throwaway store handle for this so we don't have to share
             // ownership with the long-lived server store below.
             if *migrate {
-                let migrate_store = get_store_from_config(&config.store)?.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "--migrate requires a persistent store; in-memory store has nothing to migrate"
-                    )
-                })?;
+                let migrate_store = get_store_from_config(&config.store)?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "--migrate requires a persistent store; in-memory store has nothing to migrate"
+                        )
+                    })?
+                    .store;
                 relay::migrations::run_pending(Arc::new(migrate_store)).await?;
             }
 
             // Create store from config
-            let store = if let Some(store) = get_store_from_config(&config.store)? {
+            let (store, creds_reload) = if let Some(built) = get_store_from_config(&config.store)? {
                 log_store_backend(&config.store);
-                store.init().await?;
-                Some(store)
+                built.store.init().await?;
+                (Some(built.store), built.creds_reload)
             } else {
                 tracing::warn!("No store set. Documents will be stored in memory only.");
-                None
+                (None, None)
             };
 
             // Parse URL prefix
@@ -905,6 +959,16 @@ async fn main() -> Result<()> {
             };
 
             let token = CancellationToken::new();
+
+            // In credentials-file mode, hot-reload the scoped credentials in
+            // the background so the store keeps signing after the wrapper
+            // rotates them. No-op when the store isn't file-backed.
+            if let Some(reload) = creds_reload {
+                let worker_token = token.clone();
+                tokio::spawn(async move {
+                    credentials_reload_worker(reload, worker_token).await;
+                });
+            }
 
             // Use webhook configs from configuration (TOML file or env vars)
             let webhook_configs = if config.webhooks.is_empty() {
@@ -1396,6 +1460,240 @@ async fn shutdown_signal() -> &'static str {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Scoped-credential hot-reload (credentials-file mode)
+// ---------------------------------------------------------------------------
+
+/// Switch to the env-key fallback when the file credentials are within this
+/// many seconds of expiry (or already expired).
+const CREDENTIALS_STALE_LEAD_SECS: i64 = 300;
+
+/// Redact an access key id for logging: keep the first and last 4 chars with
+/// an ellipsis between, so the full id never reaches the logs. Ids too short
+/// to redact that way are elided entirely.
+fn redact_key_id(key_id: &str) -> String {
+    let chars: Vec<char> = key_id.chars().collect();
+    if chars.len() <= 8 {
+        return "…".to_string();
+    }
+    let first: String = chars[..4].iter().collect();
+    let last: String = chars[chars.len() - 4..].iter().collect();
+    format!("{first}…{last}")
+}
+
+/// Poll interval for the credentials file: `AWS_CREDENTIALS_POLL_SECS`,
+/// default 30s, floored at 5s.
+fn credentials_poll_interval() -> std::time::Duration {
+    const DEFAULT_SECS: u64 = 30;
+    const MIN_SECS: u64 = 5;
+    let secs = env::var("AWS_CREDENTIALS_POLL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SECS)
+        .max(MIN_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+fn file_mtime(path: &str) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Result of (attempting to) re-read the credentials file on one tick.
+enum ParseOutcome {
+    /// mtime was unchanged; the file was not re-read.
+    Unchanged,
+    /// The file was re-read and parsed; carries the new expiry (unix secs).
+    Reloaded { expiry: i64 },
+    /// The file was re-read but failed to parse.
+    Failed,
+}
+
+/// Pure decision state for the reload worker, isolated from files, clocks,
+/// and metrics so the transitions are unit-testable.
+struct ReloadDecider {
+    current_expiry: i64,
+    fallback_active: bool,
+    /// Whether the "stale, no fallback" error has already been logged for the
+    /// current stale episode (so it warns once, not every tick).
+    stale_logged: bool,
+}
+
+/// What the worker should do as a result of one tick. The decider decides;
+/// the caller performs the IO / logging / metrics.
+#[derive(Debug, Default, PartialEq)]
+struct ReloadActions {
+    /// Freshly rotated from the file; carries the expiry to publish.
+    rotated: Option<i64>,
+    /// A reload was attempted but failed to parse.
+    rotation_failed: bool,
+    /// A fresh file arrived while on fallback: fallback was deactivated.
+    recovered: bool,
+    /// File credentials went stale: switch the store onto the env-key fallback.
+    switch_to_fallback: bool,
+    /// File credentials went stale and no fallback exists (deduped here).
+    stale_no_fallback: bool,
+}
+
+impl ReloadDecider {
+    fn step(&mut self, parse: ParseOutcome, now: i64, fallback_available: bool) -> ReloadActions {
+        let mut actions = ReloadActions::default();
+
+        // Phase (a): react to a changed file.
+        match parse {
+            ParseOutcome::Unchanged => {}
+            ParseOutcome::Reloaded { expiry } => {
+                self.current_expiry = expiry;
+                self.stale_logged = false;
+                actions.rotated = Some(expiry);
+                if self.fallback_active {
+                    self.fallback_active = false;
+                    actions.recovered = true;
+                }
+            }
+            ParseOutcome::Failed => {
+                actions.rotation_failed = true;
+            }
+        }
+
+        // Phase (b): staleness check against the currently-loaded expiry.
+        if !self.fallback_active && now >= self.current_expiry - CREDENTIALS_STALE_LEAD_SECS {
+            if fallback_available {
+                self.fallback_active = true;
+                actions.switch_to_fallback = true;
+            } else if !self.stale_logged {
+                self.stale_logged = true;
+                actions.stale_no_fallback = true;
+            }
+        }
+
+        actions
+    }
+}
+
+/// Poll the credentials file and hot-rotate the store's credentials in place.
+/// Runs until the cancellation token fires.
+async fn credentials_reload_worker(reload: CredentialsReload, token: CancellationToken) {
+    let CredentialsReload {
+        path,
+        credentials,
+        fallback,
+    } = reload;
+    let poll = credentials_poll_interval();
+    let fallback_available = fallback.is_some();
+
+    // Establish the starting expiry by parsing once (harmless re-rotation of
+    // the identical creds the store already loaded at construction).
+    let mut decider = match reload_credentials_file(&path, &credentials) {
+        Ok(reloaded) => {
+            if let Ok(metrics) = RelayMetrics::new() {
+                metrics.set_credential_expiry(reloaded.expiration_unix);
+            }
+            ReloadDecider {
+                current_expiry: reloaded.expiration_unix,
+                fallback_active: false,
+                stale_logged: false,
+            }
+        }
+        Err(e) => {
+            // build_s3_store already loaded the file, so this is unexpected;
+            // start with expiry 0 so the staleness check still protects us.
+            tracing::warn!(
+                "credentials reload worker: initial parse of {} failed: {}",
+                path,
+                e
+            );
+            ReloadDecider {
+                current_expiry: 0,
+                fallback_active: false,
+                stale_logged: false,
+            }
+        }
+    };
+
+    let mut last_mtime = file_mtime(&path);
+
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => break,
+            _ = tokio::time::sleep(poll) => {}
+        }
+
+        // Phase (a) input: re-read only when mtime changed. Record the
+        // observed mtime BEFORE parsing so a persistently-bad file warns
+        // once, not every tick.
+        let mtime = file_mtime(&path);
+        let changed = mtime != last_mtime;
+        last_mtime = mtime;
+        let parse = if changed {
+            match reload_credentials_file(&path, &credentials) {
+                Ok(reloaded) => {
+                    tracing::info!(
+                        "rotated S3 credentials from {} (key {})",
+                        path,
+                        redact_key_id(&reloaded.key_id)
+                    );
+                    ParseOutcome::Reloaded {
+                        expiry: reloaded.expiration_unix,
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("failed to reload credentials file {}: {}", path, e);
+                    ParseOutcome::Failed
+                }
+            }
+        } else {
+            ParseOutcome::Unchanged
+        };
+
+        let actions = decider.step(parse, now_unix(), fallback_available);
+
+        if let Ok(metrics) = RelayMetrics::new() {
+            if let Some(expiry) = actions.rotated {
+                metrics.record_credential_rotation("success");
+                metrics.set_credential_expiry(expiry);
+            }
+            if actions.rotation_failed {
+                metrics.record_credential_rotation("error");
+            }
+            if actions.recovered {
+                metrics.set_credential_fallback_active(false);
+            }
+            if actions.switch_to_fallback {
+                metrics.set_credential_fallback_active(true);
+            }
+        }
+
+        if actions.recovered {
+            tracing::info!(
+                "credentials file {} refreshed; recovered from fallback",
+                path
+            );
+        }
+        if actions.switch_to_fallback {
+            if let Some((key, secret)) = &fallback {
+                credentials.update(key.clone(), secret.clone(), None);
+            }
+            tracing::error!(
+                "credentials file {} stale; switched to env-key fallback",
+                path
+            );
+        }
+        if actions.stale_no_fallback {
+            tracing::error!(
+                "credentials file {} stale and no env-key fallback available; keeping expired credentials",
+                path
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1478,5 +1776,86 @@ mod tests {
         // Internal flycast host for internal access
         assert_eq!(hosts[1].host, "my-relay-server.flycast");
         assert_eq!(hosts[1].scheme, "http");
+    }
+
+    #[test]
+    fn test_redact_key_id_hides_full_key() {
+        let key = "ASIAIOSFODNN7EXAMPLE";
+        let redacted = redact_key_id(key);
+        // The full id must never survive redaction.
+        assert!(!redacted.contains(key));
+        assert_eq!(redacted, "ASIA…MPLE");
+        // Ids too short to redact are elided entirely.
+        assert_eq!(redact_key_id("ASIA1234"), "…");
+        assert_eq!(redact_key_id("short"), "…");
+    }
+
+    #[test]
+    fn test_reload_decider_normal_rotation() {
+        let mut d = ReloadDecider {
+            current_expiry: 1_000_000,
+            fallback_active: false,
+            stale_logged: false,
+        };
+        // A fresh file with a far-future expiry rotates and does nothing else.
+        let actions = d.step(ParseOutcome::Reloaded { expiry: 2_000_000 }, 1_000, true);
+        assert_eq!(
+            actions,
+            ReloadActions {
+                rotated: Some(2_000_000),
+                ..Default::default()
+            }
+        );
+        assert_eq!(d.current_expiry, 2_000_000);
+        assert!(!d.fallback_active);
+    }
+
+    #[test]
+    fn test_reload_decider_stale_switches_to_fallback() {
+        let mut d = ReloadDecider {
+            current_expiry: 1_000,
+            fallback_active: false,
+            stale_logged: false,
+        };
+        // now is past (expiry - lead) and a fallback exists -> switch.
+        let actions = d.step(ParseOutcome::Unchanged, 1_000, true);
+        assert!(actions.switch_to_fallback);
+        assert!(!actions.stale_no_fallback);
+        assert!(d.fallback_active);
+        // Once on fallback, further stale ticks are inert.
+        let actions = d.step(ParseOutcome::Unchanged, 2_000, true);
+        assert_eq!(actions, ReloadActions::default());
+    }
+
+    #[test]
+    fn test_reload_decider_recovers_on_fresh_file() {
+        let mut d = ReloadDecider {
+            current_expiry: 1_000,
+            fallback_active: true,
+            stale_logged: false,
+        };
+        // A fresh file with a future expiry recovers from fallback.
+        let actions = d.step(ParseOutcome::Reloaded { expiry: 5_000 }, 1_000, true);
+        assert_eq!(actions.rotated, Some(5_000));
+        assert!(actions.recovered);
+        assert!(!d.fallback_active);
+    }
+
+    #[test]
+    fn test_reload_decider_stale_no_fallback_logs_once() {
+        let mut d = ReloadDecider {
+            current_expiry: 1_000,
+            fallback_active: false,
+            stale_logged: false,
+        };
+        // No fallback available: log once...
+        let actions = d.step(ParseOutcome::Unchanged, 1_000, false);
+        assert!(actions.stale_no_fallback);
+        assert!(!actions.switch_to_fallback);
+        // ...and not again on subsequent stale ticks; creds are kept and we
+        // never enter fallback.
+        let actions = d.step(ParseOutcome::Unchanged, 2_000, false);
+        assert!(!actions.stale_no_fallback);
+        assert!(!d.fallback_active);
     }
 }
