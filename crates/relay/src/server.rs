@@ -753,6 +753,19 @@ impl Server {
         Ok(())
     }
 
+    /// The routing channel carried by a doc token, if it has one.
+    ///
+    /// Authorization stays with `verify_doc_token`, which drops the channel;
+    /// this reads it alongside so an HTTP request routes its events the same
+    /// way the websocket path already does with the same token.
+    fn doc_token_channel(&self, token: Option<&str>) -> Option<String> {
+        let authenticator = self.authenticator.as_ref()?;
+        authenticator
+            .verify_token_with_channel(token?, current_time_epoch_millis())
+            .ok()
+            .and_then(|(_, channel)| channel)
+    }
+
     fn verify_doc_token(&self, token: Option<&str>, doc: &str) -> Result<Authorization, AppError> {
         if let Some(authenticator) = &self.authenticator {
             if let Some(token) = token {
@@ -788,9 +801,10 @@ async fn get_doc_as_update(
     // All authorization types allow reading the document.
     let token = get_token_from_header(auth_header);
     let _ = server_state.verify_doc_token(token.as_deref(), &doc_id)?;
+    let channel = server_state.doc_token_channel(token.as_deref());
 
     let guard = server_state
-        .attach_doc(&doc_id, AttachKind::Http, None, None)
+        .attach_doc(&doc_id, AttachKind::Http, channel, None)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -826,13 +840,15 @@ async fn update_doc(
 ) -> Result<Response, AppError> {
     let token = get_token_from_header(auth_header);
     let authorization = server_state.verify_doc_token(token.as_deref(), &doc_id)?;
-    update_doc_inner(doc_id, server_state, authorization, body).await
+    let channel = server_state.doc_token_channel(token.as_deref());
+    update_doc_inner(doc_id, server_state, authorization, channel, body).await
 }
 
 async fn update_doc_inner(
     doc_id: String,
     server_state: Arc<Server>,
     authorization: Authorization,
+    routing_channel: Option<String>,
     body: Bytes,
 ) -> Result<Response, AppError> {
     if !matches!(authorization, Authorization::Full) {
@@ -844,7 +860,7 @@ async fn update_doc_inner(
     }
 
     let guard = server_state
-        .attach_doc(&doc_id, AttachKind::Http, None, None)
+        .attach_doc(&doc_id, AttachKind::Http, routing_channel, None)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
@@ -3410,6 +3426,7 @@ mod test {
                 doc_id.clone(),
                 server.clone(),
                 Authorization::Full,
+                None,
                 Bytes::from(content_update("k", "v")),
             )
             .await
@@ -3452,6 +3469,7 @@ mod test {
                 doc_id.clone(),
                 server.clone(),
                 Authorization::Full,
+                None,
                 Bytes::from(content_update("k", "v")),
             )
             .await
