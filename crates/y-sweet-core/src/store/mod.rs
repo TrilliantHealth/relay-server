@@ -113,20 +113,19 @@ pub trait Store: 'static {
     async fn get_with_lease(&self, key: &str) -> Result<LeasedValue> {
         self.get(key).await.map(LeasedValue::from_value)
     }
+    /// Conditional write. Backends that can express a real compare-and-set
+    /// override this; S3 does, with If-Match. The default cannot, so it
+    /// writes unconditionally rather than emulating a CAS by reading the
+    /// object back first: that read costs a full snapshot on every persist
+    /// and still races, since another writer can land between the read and
+    /// the write. A backend without a conditional write reports no
+    /// conflicts rather than pretending to detect them.
     async fn set_if_unchanged(
         &self,
         key: &str,
         value: Vec<u8>,
-        lease: &WriteLease,
+        _lease: &WriteLease,
     ) -> Result<WriteLease> {
-        let current = self.get_with_lease(key).await?;
-        if !lease.matches(&current) {
-            return Err(StoreError::LeaseConflict(format!(
-                "{} changed since it was read",
-                key
-            )));
-        }
-
         self.set(key, value.clone()).await?;
         Ok(WriteLease::for_value(Some(&value)))
     }
@@ -218,20 +217,19 @@ pub trait Store: Send + Sync {
     async fn get_with_lease(&self, key: &str) -> Result<LeasedValue> {
         self.get(key).await.map(LeasedValue::from_value)
     }
+    /// Conditional write. Backends that can express a real compare-and-set
+    /// override this; S3 does, with If-Match. The default cannot, so it
+    /// writes unconditionally rather than emulating a CAS by reading the
+    /// object back first: that read costs a full snapshot on every persist
+    /// and still races, since another writer can land between the read and
+    /// the write. A backend without a conditional write reports no
+    /// conflicts rather than pretending to detect them.
     async fn set_if_unchanged(
         &self,
         key: &str,
         value: Vec<u8>,
-        lease: &WriteLease,
+        _lease: &WriteLease,
     ) -> Result<WriteLease> {
-        let current = self.get_with_lease(key).await?;
-        if !lease.matches(&current) {
-            return Err(StoreError::LeaseConflict(format!(
-                "{} changed since it was read",
-                key
-            )));
-        }
-
         self.set(key, value.clone()).await?;
         Ok(WriteLease::for_value(Some(&value)))
     }
