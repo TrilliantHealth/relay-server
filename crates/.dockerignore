@@ -1,2 +1,6 @@
 target
+**/target
+**/_build
+**/deps
+**/node_modules
 .auth*.env
