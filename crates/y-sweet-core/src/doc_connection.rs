@@ -402,10 +402,12 @@ impl DocConnection {
         if deleted_clock_span >= LARGE_DELETION_CLOCK_SPAN {
             newly_deleted.sort_by_key(|(_, growth)| std::cmp::Reverse(*growth));
             newly_deleted.truncate(10);
-            tracing::debug!(
-                doc_id = ?self.doc_id,
-                user = ?self.user,
+            tracing::info!(
+                vpath = %self.vpath.as_deref().unwrap_or("-"),
+                name = %self.user_name.as_deref().unwrap_or("<none>"),
+                user = %self.user.as_deref().unwrap_or("-"),
                 deleted_clock_span,
+                doc_id = %self.doc_id.as_deref().unwrap_or("-"),
                 top_deleted_from = ?newly_deleted,
                 "Update applied a large deletion"
             );
