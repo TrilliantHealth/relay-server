@@ -1,6 +1,6 @@
 use crate::client_versions::{self, ClientVersions, Observation};
 use crate::doc_lifecycle::{AttachGuard, AttachKind, DocRegistry, LifecycleConfig};
-use crate::edit_bursts::{Edit, EditBursts, Verdict, BURST_QUIET};
+use crate::edit_bursts::{self, Edit, EditBursts, Verdict};
 use crate::vpath_index::VPathIndex;
 use anyhow::{anyhow, Result};
 use axum::{
@@ -914,6 +914,10 @@ impl Server {
             .route("/d/:doc_id/update", post(update_doc))
             .route("/d/:doc_id/versions", get(handle_doc_versions))
             .route(
+                "/d/:doc_id/attributed-content",
+                get(get_doc_attributed_content),
+            )
+            .route(
                 "/d/:doc_id/ws/:doc_id2",
                 get(handle_socket_upgrade_full_path),
             )
@@ -946,6 +950,10 @@ impl Server {
             }
         }
 
+        if self.semantic_logging {
+            router = router.route("/client-versions", get(get_client_versions));
+        }
+
         router.with_state(self.clone())
     }
 
@@ -969,6 +977,50 @@ impl Server {
         } else {
             app.layer(middleware::from_fn(Self::redact_error_middleware))
         };
+
+        if self.semantic_logging {
+            let bursts = self.edit_bursts.clone();
+            let burst_token = self.cancellation_token.clone();
+            let burst_user_names = self.user_names.clone();
+            let burst_client_versions = self.client_versions.clone();
+            let log_edit_bursts = move |finished: Vec<edit_bursts::FinishedBurst>| {
+                for burst in finished {
+                    tracing::info!(
+                        vpath = %burst.vpath,
+                        name = %burst_user_names
+                            .get(&burst.user)
+                            .map(String::as_str)
+                            .unwrap_or("<none>"),
+                        user = %burst.user,
+                        version = %burst_client_versions.describe(&burst.clients),
+                        clients = %burst
+                            .clients
+                            .iter()
+                            .map(u64::to_string)
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        edits = burst.edits,
+                        update_bytes = burst.bytes,
+                        span_ms = burst.span.as_millis(),
+                        doc_id = %burst.doc_id,
+                        channel = %burst.channel,
+                        "Doc edit burst"
+                    );
+                }
+            };
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(edit_bursts::BURST_QUIET / 4);
+                loop {
+                    tokio::select! {
+                        _ = ticker.tick() => log_edit_bursts(bursts.take_finished()),
+                        _ = burst_token.cancelled() => {
+                            log_edit_bursts(bursts.drain_all());
+                            break;
+                        }
+                    }
+                }
+            });
+        }
 
         tracing::info!("Starting HTTP server...");
         axum::serve(listener, app.into_make_service())
@@ -1291,6 +1343,59 @@ async fn handle_socket_upgrade_with_channel_and_user(
             record_client_version,
         )
     }))
+}
+
+#[derive(Deserialize)]
+struct AttributedContentParams {
+    root: Option<String>,
+}
+
+async fn get_doc_attributed_content(
+    State(server_state): State<Arc<Server>>,
+    Path(doc_id): Path<String>,
+    Query(params): Query<AttributedContentParams>,
+    auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
+) -> Result<Response, AppError> {
+    server_state.check_auth(auth_header)?;
+
+    let guard = server_state
+        .attach_doc(&doc_id, AttachKind::Http, None, None)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let root = params.root.as_deref().unwrap_or("contents");
+    let awareness = guard.awareness();
+    let awareness = awareness.read().unwrap();
+    match crate::attributed_content::attributed_content(awareness.doc(), root) {
+        Some(content) => Ok(Json(json!({
+            "doc_id": doc_id,
+            "root": content.root,
+            "spans": content.spans,
+        }))
+        .into_response()),
+        None => Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            anyhow!("doc has no text root named {root}"),
+        )),
+    }
+}
+
+async fn get_client_versions(
+    auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
+    State(server_state): State<Arc<Server>>,
+) -> Result<Json<Value>, AppError> {
+    server_state.check_auth(auth_header)?;
+
+    let entries = server_state.client_versions.snapshot();
+    Ok(Json(json!({
+        "count": entries.len(),
+        "client_versions": entries
+            .into_iter()
+            .map(|(client_id, version, name)| {
+                (client_id.to_string(), json!({"version": version, "name": name}))
+            })
+            .collect::<serde_json::Map<String, Value>>(),
+    })))
 }
 
 fn verify_socket_token(
