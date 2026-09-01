@@ -1,4 +1,4 @@
-use crate::client_versions::{ClientVersions, Observation};
+use crate::client_versions::{self, ClientVersions, Observation};
 use crate::doc_lifecycle::{AttachGuard, AttachKind, DocRegistry, LifecycleConfig};
 use crate::edit_bursts::{Edit, EditBursts, Verdict, BURST_QUIET};
 use crate::vpath_index::VPathIndex;
@@ -38,6 +38,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use url::Url;
+use y_sweet_core::doc_connection::AwarenessEntryFacts;
 use y_sweet_core::edit_author;
 use y_sweet_core::{
     api_types::{
@@ -261,6 +262,10 @@ pub struct Server {
     edit_bursts: Arc<EditBursts>,
     semantic_logging: bool,
 }
+
+/// Notified for each awareness entry, so a client id can be bound to the
+/// plugin build that sent it.
+type ClientVersionRecorder = Arc<dyn Fn(&AwarenessEntryFacts) + Send + Sync>;
 
 /// When this user's denial was last logged, and how many went unlogged since.
 struct DenialLogState {
@@ -1053,6 +1058,23 @@ impl Server {
 #[derive(Deserialize)]
 struct HandlerParams {
     token: Option<String>,
+    /// Plugin version the connecting client reports (clients >= 0.8.8).
+    v: Option<String>,
+    /// Client ids the connection declares as its own, comma-separated.
+    cid: Option<String>,
+}
+
+impl HandlerParams {
+    fn declared_client_ids(&self) -> Vec<u64> {
+        self.cid
+            .as_deref()
+            .map(|ids| {
+                ids.split(',')
+                    .filter_map(|id| id.trim().parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 async fn get_doc_as_update(
@@ -1134,6 +1156,7 @@ async fn update_doc_inner(
     Ok(StatusCode::OK.into_response())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_socket_upgrade_with_channel_and_user(
     ws: WebSocketUpgrade,
     Path(doc_id): Path<String>,
@@ -1141,6 +1164,8 @@ async fn handle_socket_upgrade_with_channel_and_user(
     routing_channel: Option<String>,
     user: Option<String>,
     token: Option<String>,
+    version: Option<String>,
+    declared_client_ids: Vec<u64>,
     State(server_state): State<Arc<Server>>,
 ) -> Result<Response, AppError> {
     server_state
@@ -1163,10 +1188,84 @@ async fn handle_socket_upgrade_with_channel_and_user(
     };
 
     let user_for_pud = user.clone();
+    let channel_for_vpath = routing_channel.clone();
     let guard = server_state
         .attach_doc(&doc_id, AttachKind::Socket, routing_channel, user)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let user_name = user_for_pud
+        .as_deref()
+        .and_then(|id| server_state.user_names.get(id))
+        .cloned();
+    let vpath = server_state.semantic_logging.then(|| ()).and_then(|_| {
+        let channel = channel_for_vpath.as_deref()?;
+        let folder = server_state.registry.peek(channel)?;
+        server_state.vpath_index.resolve(channel, &folder, &doc_id)
+    });
+
+    // A client that names its own ids lets us bind them to the version it
+    // reported, rather than inferring from whichever connection was seen
+    // first. Register them under the user at the same time: doing it here,
+    // once per connection, keeps PermanentUserData writes off the awareness
+    // path, where a write lock per message serialized against sync.
+    if let (Some(v), Some(user_id)) = (version.as_deref(), user_for_pud.as_deref()) {
+        for client_id in declared_client_ids {
+            if let Some(recorded) =
+                server_state
+                    .client_versions
+                    .declare(client_id, v, user_name.as_deref())
+            {
+                tracing::debug!(
+                    client_id,
+                    version = %recorded.version,
+                    previous = %recorded.previous.as_deref().unwrap_or(client_versions::UNKNOWN),
+                    name = %user_name.as_deref().unwrap_or("<none>"),
+                    doc_id = %doc_id,
+                    "Recorded client version"
+                );
+            }
+            // Server-generated ids are 53-bit; a real client id is not.
+            if client_id >> 53 == 0 {
+                if let Ok(awareness) = guard.doc().awareness().read() {
+                    DocConnection::register_pud_client_id_on_doc(
+                        awareness.doc(),
+                        user_id,
+                        yrs::block::ClientID::new(client_id),
+                    );
+                }
+            }
+        }
+    }
+
+    let record_client_version: ClientVersionRecorder = {
+        let client_versions = server_state.client_versions.clone();
+        let connection_version = version.clone();
+        let doc_id_for_log = doc_id.clone();
+        Arc::new(move |facts: &AwarenessEntryFacts| {
+            if let Some(recorded) = client_versions.observe(Observation {
+                client_id: facts.client_id,
+                declared: facts.declared_version.as_deref(),
+                name: facts.user_name.as_deref(),
+                solo_live: facts.solo_live,
+                connection_version: connection_version.as_deref(),
+            }) {
+                tracing::debug!(
+                    client_id = facts.client_id,
+                    version = %recorded.version,
+                    previous = %recorded.previous.as_deref().unwrap_or(client_versions::UNKNOWN),
+                    name = %facts.user_name.as_deref().unwrap_or("<none>"),
+                    doc_id = %doc_id_for_log,
+                    "Recorded client version"
+                );
+            }
+            if let Some(declared) = facts.declared_version.as_deref() {
+                for extra in &facts.extra_client_ids {
+                    client_versions.declare(*extra, declared, facts.user_name.as_deref());
+                }
+            }
+        })
+    };
     // Socket loops watch the doc-close token (a child of the server token)
     // so shutdown can close them ahead of the graceful drain.
     let cancellation_token = server_state.doc_close_token.clone();
@@ -1187,6 +1286,9 @@ async fn handle_socket_upgrade_with_channel_and_user(
             sync_protocol_event_sender,
             doc_id_clone,
             metrics,
+            vpath,
+            user_name,
+            record_client_version,
         )
     }))
 }
@@ -1260,7 +1362,9 @@ async fn handle_socket_upgrade_deprecated(
     );
     let (authorization, channel, user) =
         verify_socket_token(&server_state, &doc_id, params.token.as_deref())?;
+    server_state.check_client_version(user.as_deref(), params.v.as_deref())?;
 
+    let declared_client_ids = params.declared_client_ids();
     handle_socket_upgrade_with_channel_and_user(
         ws,
         Path(doc_id),
@@ -1268,6 +1372,8 @@ async fn handle_socket_upgrade_deprecated(
         channel,
         user,
         params.token.clone(), // Pass the token from query params
+        params.v.clone(),
+        declared_client_ids,
         State(server_state),
     )
     .await
@@ -1291,7 +1397,9 @@ async fn handle_socket_upgrade_full_path(
 
     let (authorization, channel, user) =
         verify_socket_token(&server_state, &doc_id, params.token.as_deref())?;
+    server_state.check_client_version(user.as_deref(), params.v.as_deref())?;
 
+    let declared_client_ids = params.declared_client_ids();
     handle_socket_upgrade_with_channel_and_user(
         ws,
         Path(doc_id),
@@ -1299,11 +1407,14 @@ async fn handle_socket_upgrade_full_path(
         channel,
         user,
         params.token.clone(), // Pass the token from query params
+        params.v.clone(),
+        declared_client_ids,
         State(server_state),
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_socket(
     socket: WebSocket,
     guard: AttachGuard,
@@ -1314,6 +1425,9 @@ async fn handle_socket(
     sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
     doc_id: String,
     metrics: Arc<RelayMetrics>,
+    vpath: Option<String>,
+    user_name: Option<String>,
+    record_client_version: ClientVersionRecorder,
 ) {
     let (sink, stream) = socket.split();
     handle_socket_inner(
@@ -1327,12 +1441,16 @@ async fn handle_socket(
         sync_protocol_event_sender,
         doc_id,
         metrics,
+        vpath,
+        user_name,
+        record_client_version,
     )
     .await
 }
 
 /// Generic over the socket halves so teardown behavior can be tested without
 /// a real WebSocket upgrade.
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 async fn handle_socket_inner<S, T, E>(
     mut sink: S,
@@ -1345,6 +1463,9 @@ async fn handle_socket_inner<S, T, E>(
     sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
     doc_id: String,
     metrics: Arc<RelayMetrics>,
+    vpath: Option<String>,
+    user_name: Option<String>,
+    record_client_version: ClientVersionRecorder,
 ) where
     S: Sink<Message> + Send + Unpin + 'static,
     T: Stream<Item = Result<Message, E>> + Unpin,
@@ -1452,6 +1573,13 @@ async fn handle_socket_inner<S, T, E>(
     );
     conn.set_sync_kv(sync_kv);
     conn.set_doc_id(doc_id.clone());
+    conn.set_on_client_version(Box::new(move |facts| record_client_version(facts)));
+    if let Some(vpath) = vpath {
+        conn.set_vpath(vpath);
+    }
+    if let Some(user_name) = user_name {
+        conn.set_user_name(user_name);
+    }
     if let Some(user) = user {
         conn.set_user(user);
     }
@@ -3993,6 +4121,9 @@ mod test {
                 Arc::new(SyncProtocolEventSender::new()),
                 "test_doc".to_string(),
                 metrics.clone(),
+                None,
+                None,
+                Arc::new(|_| {}),
             ));
 
             SocketHarness {
