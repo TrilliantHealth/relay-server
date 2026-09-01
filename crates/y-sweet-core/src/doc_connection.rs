@@ -37,12 +37,15 @@ type Callback = Arc<dyn Fn(&[u8]) + 'static + Send + Sync>;
 const SYNC_STATUS_MESSAGE: u8 = 102;
 
 /// An incoming update that grows the doc's delete set by at least this many
-/// clock units is logged. Clock units roughly correspond to characters for
-/// text content, so this catches section-or-larger deletions while ignoring
-/// ordinary editing. Growth is measured across the apply because SyncStep2
-/// always carries the sender's full historical delete set, which is almost
-/// entirely already applied.
-const LARGE_DELETION_CLOCK_SPAN: u32 = 200;
+/// clock units is logged. Clock units count operations, not characters: a
+/// character edited several times accumulates one per edit, so an ordinary
+/// text deletion can already span hundreds. The cases this targets are mass
+/// reverts, which run to five figures.
+///
+/// Growth is measured across the apply because SyncStep2 always carries the
+/// sender's full historical delete set, which is almost entirely already
+/// applied.
+const LARGE_DELETION_CLOCK_SPAN: u32 = 5000;
 
 /// Transaction origin for the server's own PermanentUserData bookkeeping.
 ///
