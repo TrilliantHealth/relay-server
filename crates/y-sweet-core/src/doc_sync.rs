@@ -251,7 +251,7 @@ impl DocWithSyncKv {
         }
 
         ids_arr.push_back(&mut txn, yrs::Any::Number(client_id as f64));
-        tracing::info!(
+        tracing::debug!(
             user_id,
             client_id,
             "Registered client_id for user via server-driven PUD"

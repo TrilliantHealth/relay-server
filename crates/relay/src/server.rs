@@ -803,7 +803,7 @@ impl Server {
                 let routing_channel = routing_channel.clone();
                 let user = user.clone();
                 async move {
-                    tracing::info!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc");
+                    tracing::debug!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc");
                     self.build_doc(doc_id, routing_channel, user).await
                 }
             })
@@ -827,7 +827,7 @@ impl Server {
                 let routing_channel = routing_channel.clone();
                 let user = user.clone();
                 async move {
-                    tracing::info!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc");
+                    tracing::debug!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc");
                     self.build_doc(doc_id, routing_channel, user).await
                 }
             })
@@ -1850,7 +1850,7 @@ async fn handle_socket_inner<S, T, E>(
                 if last_pong.elapsed() > PONG_TIMEOUT && !pong_timed_out {
                     pong_timed_out = true;
                     metrics.record_pong_timeout();
-                    tracing::info!(
+                    tracing::debug!(
                         doc_id = %doc_id,
                         "Pong timeout (observe-only): a keepalive reaper would close this connection"
                     );
@@ -2187,7 +2187,7 @@ async fn handle_file_upload_url(
     TypedHeader(host): TypedHeader<headers::Host>,
     auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
 ) -> Result<Json<FileUploadUrlResponse>, AppError> {
-    tracing::info!(doc_id = %doc_id, "Generating file upload URL");
+    tracing::debug!(doc_id = %doc_id, "Generating file upload URL");
 
     // Get token and extract metadata
     let token = get_token_from_header(auth_header);
@@ -2311,7 +2311,7 @@ async fn handle_file_download_url(
     Query(params): Query<FileDownloadQueryParams>,
     auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
 ) -> Result<Json<FileDownloadUrlResponse>, AppError> {
-    tracing::info!(doc_id = %doc_id, hash = ?params.hash, "Generating file download URL");
+    tracing::debug!(doc_id = %doc_id, hash = ?params.hash, "Generating file download URL");
 
     // Get token
     let token = get_token_from_header(auth_header);
