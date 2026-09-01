@@ -188,7 +188,7 @@ fn _doc_from(snapshot: &[u8]) -> Option<yrs::Doc> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yrs::{Map, Text, Transact};
+    use yrs::{Array, Map, Text, Transact};
 
     fn register(doc: &yrs::Doc, user_id: &str, client_ids: &[u64]) {
         let users = doc.get_or_insert_map("users");
