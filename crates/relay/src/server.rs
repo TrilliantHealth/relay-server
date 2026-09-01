@@ -1,4 +1,7 @@
+use crate::client_versions::{ClientVersions, Observation};
 use crate::doc_lifecycle::{AttachGuard, AttachKind, DocRegistry, LifecycleConfig};
+use crate::edit_bursts::{Edit, EditBursts, Verdict, BURST_QUIET};
+use crate::vpath_index::VPathIndex;
 use anyhow::{anyhow, Result};
 use axum::{
     body::Bytes,
@@ -22,7 +25,12 @@ use futures::{Sink, SinkExt, Stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{io::Write, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    io::Write,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 use tempfile::NamedTempFile;
 use tokio::{
     net::TcpListener,
@@ -30,6 +38,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use url::Url;
+use y_sweet_core::edit_author;
 use y_sweet_core::{
     api_types::{
         validate_doc_name, validate_file_hash, AuthDocRequest, Authorization, ClientToken,
@@ -60,6 +69,9 @@ const PONG_TIMEOUT: Duration = Duration::from_secs(40);
 /// full/recovered transition warns cover the common case; this distinguishes a
 /// client that is wedged for hours from one that stalled briefly.
 const CHANNEL_FULL_REWARN: Duration = Duration::from_secs(300);
+
+/// How often one user's version denial is logged, however often they retry.
+const DENIAL_LOG_INTERVAL: Duration = Duration::from_secs(1800);
 
 #[derive(Clone, Debug)]
 pub struct AllowedHost {
@@ -238,6 +250,22 @@ pub struct Server {
     event_dispatcher: Option<Arc<dyn EventDispatcher>>,
     sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
     metrics: Arc<RelayMetrics>,
+    /// Plugin versions permitted to open a doc websocket. Empty means no gating.
+    allowed_client_versions: HashSet<String>,
+    /// Per-user throttle for the denial warn, so a looping client cannot flood.
+    denial_log_throttle: Mutex<HashMap<String, DenialLogState>>,
+    client_versions: Arc<ClientVersions>,
+    vpath_index: Arc<VPathIndex>,
+    /// Relay user id -> display name, for log readability only.
+    user_names: Arc<HashMap<String, String>>,
+    edit_bursts: Arc<EditBursts>,
+    semantic_logging: bool,
+}
+
+/// When this user's denial was last logged, and how many went unlogged since.
+struct DenialLogState {
+    last_logged: Instant,
+    suppressed: u64,
 }
 
 impl Server {
@@ -306,7 +334,121 @@ impl Server {
             event_dispatcher,
             sync_protocol_event_sender,
             metrics,
+            allowed_client_versions: HashSet::new(),
+            denial_log_throttle: Mutex::new(HashMap::new()),
+            client_versions: Arc::new(ClientVersions::new()),
+            vpath_index: Arc::new(VPathIndex::default()),
+            user_names: Arc::new(HashMap::new()),
+            edit_bursts: Arc::new(EditBursts::new()),
+            semantic_logging: false,
         })
+    }
+
+    fn denial_log_permit(&self, user: &str) -> Option<u64> {
+        let mut throttle = self.denial_log_throttle.lock().unwrap();
+        match throttle.get_mut(user) {
+            Some(state) if state.last_logged.elapsed() < DENIAL_LOG_INTERVAL => {
+                state.suppressed += 1;
+                None
+            }
+            Some(state) => {
+                let suppressed = state.suppressed;
+                state.last_logged = Instant::now();
+                state.suppressed = 0;
+                Some(suppressed)
+            }
+            None => {
+                throttle.insert(
+                    user.to_string(),
+                    DenialLogState {
+                        last_logged: Instant::now(),
+                        suppressed: 0,
+                    },
+                );
+                Some(0)
+            }
+        }
+    }
+
+    fn check_client_version(
+        &self,
+        user: Option<&str>,
+        version: Option<&str>,
+    ) -> Result<(), AppError> {
+        let Some(user) = user else {
+            return Ok(());
+        };
+        if self.allowed_client_versions.is_empty() {
+            return Ok(());
+        }
+
+        match version {
+            Some(v) if self.allowed_client_versions.contains(v) => Ok(()),
+            _ => {
+                if let Some(suppressed) = self.denial_log_permit(user) {
+                    tracing::warn!(
+                        name = %self
+                            .user_names
+                            .get(user)
+                            .map(String::as_str)
+                            .unwrap_or("<none>"),
+                        user = %user,
+                        version = %version.unwrap_or("none"),
+                        allowed = %self
+                            .allowed_client_versions
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        suppressed,
+                        interval_secs = DENIAL_LOG_INTERVAL.as_secs(),
+                        "Blocked user on client version"
+                    );
+                }
+                Err(AppError::auth(
+                    StatusCode::FORBIDDEN,
+                    anyhow!("This plugin version is temporarily blocked from sync; run witchdoctor to upgrade"),
+                    "client_version_blocked",
+                ))
+            }
+        }
+    }
+
+    /// Restrict doc websocket access to these plugin versions. Empty leaves
+    /// every version allowed; server tokens are exempt either way.
+    pub fn with_allowed_client_versions(
+        mut self,
+        versions: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.allowed_client_versions = versions.into_iter().collect();
+        if !self.allowed_client_versions.is_empty() {
+            tracing::warn!(
+                "Requiring client version in {:?} for doc websocket access",
+                self.allowed_client_versions
+            );
+        }
+        self
+    }
+
+    /// Display names for log readability. Never consulted for authorization.
+    pub fn with_user_names(mut self, names: impl IntoIterator<Item = (String, String)>) -> Self {
+        let names: HashMap<String, String> = names.into_iter().collect();
+        if !names.is_empty() {
+            tracing::info!("Loaded display names for {} user id(s)", names.len());
+        }
+        self.user_names = Arc::new(names);
+        self
+    }
+
+    pub fn with_semantic_logging(mut self, enabled: bool) -> Self {
+        self.semantic_logging = enabled;
+        if enabled {
+            tracing::info!(
+                "Semantic logging enabled: edit attribution, vpath resolution, \
+                 and /client-versions endpoint are active"
+            );
+        }
+        self
     }
 
     /// Close every doc WebSocket: each socket loop breaks, sends its
@@ -445,6 +587,12 @@ impl Server {
             let routing_channel_for_callback = routing_channel_name.clone();
             let user_for_callback = user.clone();
             let doc_id_for_callback = doc_id.to_string();
+            let registry = self.registry.clone();
+            let vpath_index = self.vpath_index.clone();
+            let user_names = self.user_names.clone();
+            let edit_bursts = self.edit_bursts.clone();
+            let client_versions = self.client_versions.clone();
+            let semantic = self.semantic_logging;
             // The parent pin lives in this closure, which the doc owns via
             // its SyncKv observer: the guard detaches when the doc drops.
             let parent_guard = parent_guard;
@@ -479,23 +627,126 @@ impl Server {
                         }
                     }
 
-                    // Log the full event payload as JSON after user assignment
-                    match serde_json::to_string(&event) {
-                        Ok(json_str) => {
-                            tracing::info!("Document updated event dispatched: {}", json_str);
+                    // The server's own PermanentUserData bookkeeping is not
+                    // an edit anyone made; dispatch it without logging one.
+                    if event
+                        .update
+                        .as_deref()
+                        .is_some_and(edit_author::is_server_only_update)
+                    {
+                        dispatcher.send_event(EventEnvelope::new(
+                            routing_channel_for_callback.clone(),
+                            event,
+                        ));
+                        return;
+                    }
+
+                    if semantic {
+                        let edited_doc_id = event.doc_id.as_str();
+                        let channel = event
+                            .metadata
+                            .get("channel")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(&routing_channel_for_callback);
+
+                        // `writer` names the connection that applied this
+                        // update, so it is right even for a deletion - the one
+                        // case `user` cannot answer, because a deletion names
+                        // no author for the observer to resolve.
+                        let user_id = event.writer.as_deref().or(event.user.as_deref());
+                        let name_of = |id: Option<&str>| {
+                            id.and_then(|id| user_names.get(id))
+                                .map(String::as_str)
+                                .unwrap_or("<none>")
+                                .to_string()
+                        };
+
+                        let editing_folder_doc = channel == edited_doc_id;
+                        if editing_folder_doc {
+                            if let Some(delta) = event.state.as_deref().and_then(|state| {
+                                vpath_index.sync_membership_from_snapshot(channel, state)
+                            }) {
+                                // Whose entries were removed - the owner of the
+                                // deleted blocks. yjs records nothing about who
+                                // removed them, so a removed= line with user=-
+                                // is attributable no further.
+                                let deleted_by = match (&event.update, &event.state) {
+                                    (Some(update), Some(state)) => {
+                                        edit_author::deleted_user_from_snapshot(state, update)
+                                    }
+                                    _ => None,
+                                };
+
+                                tracing::info!(
+                                    added = %delta.added.join(","),
+                                    removed = %delta.removed.join(","),
+                                    moved = %delta
+                                        .moved
+                                        .iter()
+                                        .map(|(from, to)| format!("{from}->{to}"))
+                                        .collect::<Vec<_>>()
+                                        .join(","),
+                                    name = %name_of(user_id),
+                                    user = %user_id.unwrap_or("-"),
+                                    clients = %event
+                                        .update
+                                        .as_deref()
+                                        .map(edit_author::clients_for_update)
+                                        .unwrap_or_else(|| "-".to_string()),
+                                    deleted_name = %name_of(deleted_by.as_deref()),
+                                    deleted_user = %deleted_by.as_deref().unwrap_or("-"),
+                                    deleted_clients = %event
+                                        .update
+                                        .as_deref()
+                                        .map(edit_author::deleted_clients_for_update)
+                                        .unwrap_or_else(|| "-".to_string()),
+                                    channel = %channel,
+                                    "Folder membership changed"
+                                );
+                            }
                         }
-                        Err(e) => {
+
+                        let vpath = registry
+                            .peek(channel)
+                            .filter(|_| !editing_folder_doc)
+                            .and_then(|folder| {
+                                vpath_index.resolve(channel, &folder, edited_doc_id)
+                            });
+                        let vpath_str = vpath.as_deref().unwrap_or("-");
+                        let update_bytes = event.update.as_ref().map_or(0, Vec::len);
+                        let edit_clients = event
+                            .update
+                            .as_deref()
+                            .map(edit_author::clients_in_update)
+                            .unwrap_or_default();
+
+                        if let Verdict::Leading = edit_bursts.record(Edit {
+                            doc_id: edited_doc_id,
+                            user: user_id.unwrap_or("-"),
+                            vpath: vpath_str,
+                            channel,
+                            clients: &edit_clients,
+                            bytes: update_bytes,
+                        }) {
                             tracing::info!(
-                                "Document updated event dispatched for doc_id: {} (JSON serialization failed: {})",
-                                event.doc_id, e
+                                vpath = %vpath_str,
+                                name = %name_of(user_id),
+                                user = %user_id.unwrap_or("-"),
+                                version = %client_versions.describe(&edit_clients),
+                                clients = %edit_clients
+                                    .iter()
+                                    .map(u64::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(","),
+                                update_bytes,
+                                doc_id = %edited_doc_id,
+                                channel = %channel,
+                                "Doc edited"
                             );
                         }
                     }
 
-                    // Step 1: Create the envelope with predetermined routing channel
                     let envelope = EventEnvelope::new(routing_channel_for_callback.clone(), event);
-
-                    // Step 2: Send via dispatcher
                     dispatcher.send_event(envelope);
                 }) as y_sweet_core::webhook::WebhookCallback)
             } else {

@@ -1422,5 +1422,4 @@ url = "https://example.com"
 
         assert!(config.server.user_names.is_empty());
     }
-
 }
