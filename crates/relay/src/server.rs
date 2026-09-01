@@ -1875,13 +1875,31 @@ async fn handle_socket_inner<S, T, E>(
     };
 
     metrics.record_websocket_close(close_reason);
-    tracing::info!(
-        doc_id = %doc_id,
-        user = ?log_user,
-        close_reason,
-        duration_secs = connected_at.elapsed().as_secs(),
-        "WebSocket disconnected"
-    );
+    // A client closing cleanly is the common case: Obsidian closes and
+    // reopens sockets as the user moves between files, which on a busy vault
+    // is a steady stream that drowns everything else. A stream that just ends
+    // is the same churn seen from the other side - the client went away
+    // without a handshake, and the reconnect handles it. Neither says
+    // anything an operator would act on, and both stay available at debug and
+    // in the close metric. token_expired, sink_error and server_shutdown do.
+    let duration_secs = connected_at.elapsed().as_secs();
+    if close_reason == "close_frame" || close_reason == "stream_eof" {
+        tracing::debug!(
+            doc_id = %doc_id,
+            user = ?log_user,
+            close_reason,
+            duration_secs,
+            "WebSocket disconnected"
+        );
+    } else {
+        tracing::info!(
+            doc_id = %doc_id,
+            user = ?log_user,
+            close_reason,
+            duration_secs,
+            "WebSocket disconnected"
+        );
+    }
 
     // Teardown is pure RAII: dropping the guard detaches this connection
     // from the doc's lifecycle actor, and if it was the last one, the
