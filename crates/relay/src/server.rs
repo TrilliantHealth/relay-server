@@ -482,10 +482,10 @@ impl Server {
                     // Log the full event payload as JSON after user assignment
                     match serde_json::to_string(&event) {
                         Ok(json_str) => {
-                            tracing::info!("Document updated event dispatched: {}", json_str);
+                            tracing::trace!("Document updated event dispatched: {}", json_str);
                         }
                         Err(e) => {
-                            tracing::info!(
+                            tracing::trace!(
                                 "Document updated event dispatched for doc_id: {} (JSON serialization failed: {})",
                                 event.doc_id, e
                             );
