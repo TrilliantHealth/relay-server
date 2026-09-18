@@ -13,4 +13,5 @@ pub mod stores;
 pub mod subdocs;
 #[cfg(test)]
 pub(crate) mod test_util;
+pub mod vpath_index;
 pub mod webhook;
