@@ -349,6 +349,17 @@ impl Server {
         })
     }
 
+    /// The allowlist in a stable order, for logs.
+    fn sorted_allowed_versions(&self) -> String {
+        let mut versions: Vec<&str> = self
+            .allowed_client_versions
+            .iter()
+            .map(String::as_str)
+            .collect();
+        versions.sort_unstable();
+        versions.join(",")
+    }
+
     fn denial_log_permit(&self, user: &str) -> Option<u64> {
         let mut throttle = self.denial_log_throttle.lock().unwrap();
         match throttle.get_mut(user) {
@@ -399,12 +410,7 @@ impl Server {
                             .unwrap_or("<none>"),
                         user = %user,
                         version = %version.unwrap_or("none"),
-                        allowed = %self
-                            .allowed_client_versions
-                            .iter()
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(","),
+                        allowed = %self.sorted_allowed_versions(),
                         suppressed,
                         interval_secs = DENIAL_LOG_INTERVAL.as_secs(),
                         "Blocked user on client version"
@@ -427,9 +433,11 @@ impl Server {
     ) -> Self {
         self.allowed_client_versions = versions.into_iter().collect();
         if !self.allowed_client_versions.is_empty() {
+            // Sorted: the set's own order is the hash order, which scatters the
+            // versions and makes a reader hunt for the one they care about.
             tracing::warn!(
-                "Requiring client version in {:?} for doc websocket access",
-                self.allowed_client_versions
+                "Requiring client version in [{}] for doc websocket access",
+                self.sorted_allowed_versions()
             );
         }
         self
@@ -5480,6 +5488,19 @@ mod client_version_gate_tests {
     }
 
     /// The default. An unconfigured server must let every client through.
+    /// The set's own iteration order is the hash order, which puts the fleet's
+    /// actual version in an arbitrary position and reads as though entries are
+    /// missing.
+    #[tokio::test]
+    async fn the_logged_allowlist_is_sorted() {
+        assert_eq!(
+            gated(&["0.8.12", "0.8.9-th.4", "0.8.10-th.1", "0.8.12-th.1"])
+                .await
+                .sorted_allowed_versions(),
+            "0.8.10-th.1,0.8.12,0.8.12-th.1,0.8.9-th.4"
+        );
+    }
+
     #[tokio::test]
     async fn an_empty_allowlist_gates_nothing() {
         let server = test_server(
