@@ -37,12 +37,15 @@ type Callback = Arc<dyn Fn(&[u8]) + 'static + Send + Sync>;
 const SYNC_STATUS_MESSAGE: u8 = 102;
 
 /// An incoming update that grows the doc's delete set by at least this many
-/// clock units is logged. Clock units roughly correspond to characters for
-/// text content, so this catches section-or-larger deletions while ignoring
-/// ordinary editing. Growth is measured across the apply because SyncStep2
-/// always carries the sender's full historical delete set, which is almost
-/// entirely already applied.
-const LARGE_DELETION_CLOCK_SPAN: u32 = 200;
+/// clock units is logged. Clock units count operations, not characters: a
+/// character edited several times accumulates one per edit, so an ordinary
+/// text deletion can already span hundreds. The cases this targets are mass
+/// reverts, which run to five figures.
+///
+/// Growth is measured across the apply because SyncStep2 always carries the
+/// sender's full historical delete set, which is almost entirely already
+/// applied.
+const LARGE_DELETION_CLOCK_SPAN: u32 = 5000;
 
 /// Transaction origin for the server's own PermanentUserData bookkeeping.
 ///
@@ -91,6 +94,48 @@ enum InitialSync {
     Complete,
 }
 
+/// What a single awareness entry declares about the client that sent it.
+///
+/// Parsed rather than trusted wholesale: only a solo, non-null entry says
+/// anything about its own sender, since clients relay the whole awareness map
+/// on reconnect and every other entry in such a batch is an echo.
+pub struct AwarenessEntryFacts {
+    pub client_id: u64,
+    pub declared_version: Option<String>,
+    pub user_name: Option<String>,
+    pub extra_client_ids: Vec<u64>,
+    pub solo_live: bool,
+}
+
+impl AwarenessEntryFacts {
+    fn from_entry(client_id: u64, json: &str, solo: bool) -> Self {
+        let live = json.trim() != "null";
+        let state = serde_json::from_str::<serde_json::Value>(json).ok();
+        let user = state.as_ref().and_then(|s| s.get("user"));
+        Self {
+            client_id,
+            declared_version: state
+                .as_ref()
+                .and_then(|s| s.get("relayVersion"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            user_name: user
+                .and_then(|u| u.get("name"))
+                .and_then(|n| n.as_str())
+                .map(str::to_string),
+            extra_client_ids: state
+                .as_ref()
+                .and_then(|s| s.get("relayClientIds"))
+                .and_then(|ids| ids.as_array())
+                .map(|ids| ids.iter().filter_map(|id| id.as_u64()).collect())
+                .unwrap_or_default(),
+            solo_live: solo && live,
+        }
+    }
+}
+
+type ClientVersionCallback = Box<dyn Fn(&AwarenessEntryFacts) + Send + Sync>;
+
 pub struct DocConnection {
     awareness: Arc<RwLock<Awareness>>,
     #[allow(unused)] // acts as RAII guard
@@ -121,6 +166,16 @@ pub struct DocConnection {
 
     /// Document ID, for log context only.
     doc_id: Option<String>,
+
+    /// Vault-relative path of this doc, for log context only.
+    vpath: Option<String>,
+
+    /// Display name for `user`, for log readability only.
+    user_name: Option<String>,
+
+    /// Notified for each awareness entry, so the server can record which
+    /// plugin build a client id belongs to.
+    on_client_version: Option<ClientVersionCallback>,
 
     initial_sync: Mutex<InitialSync>,
 }
@@ -282,6 +337,9 @@ impl DocConnection {
             sync_kv: None,
             user: None,
             doc_id: None,
+            vpath: None,
+            user_name: None,
+            on_client_version: None,
             initial_sync: Mutex::new(initial_sync),
         }
     }
@@ -313,6 +371,18 @@ impl DocConnection {
         self.doc_id = Some(doc_id);
     }
 
+    pub fn set_vpath(&mut self, vpath: String) {
+        self.vpath = Some(vpath);
+    }
+
+    pub fn set_user_name(&mut self, user_name: String) {
+        self.user_name = Some(user_name);
+    }
+
+    pub fn set_on_client_version(&mut self, callback: ClientVersionCallback) {
+        self.on_client_version = Some(callback);
+    }
+
     /// Log when this connection's update grew the doc's delete set by
     /// [LARGE_DELETION_CLOCK_SPAN] or more. The doc structurally records who
     /// inserted content but not who deleted it, so the connection is the only
@@ -335,10 +405,12 @@ impl DocConnection {
         if deleted_clock_span >= LARGE_DELETION_CLOCK_SPAN {
             newly_deleted.sort_by_key(|(_, growth)| std::cmp::Reverse(*growth));
             newly_deleted.truncate(10);
-            tracing::debug!(
-                doc_id = ?self.doc_id,
-                user = ?self.user,
+            tracing::info!(
+                vpath = %self.vpath.as_deref().unwrap_or("-"),
+                name = %self.user_name.as_deref().unwrap_or("<none>"),
+                user = %self.user.as_deref().unwrap_or("-"),
                 deleted_clock_span,
+                doc_id = %self.doc_id.as_deref().unwrap_or("-"),
                 top_deleted_from = ?newly_deleted,
                 "Update applied a large deletion"
             );
@@ -392,7 +464,7 @@ impl DocConnection {
 
     /// Register a client_id in the "users" PermanentUserData map on the document.
     /// Takes a Doc reference directly to avoid re-locking awareness.
-    fn register_pud_client_id_on_doc(doc: &yrs::Doc, user_id: &str, client_id: ClientID) {
+    pub fn register_pud_client_id_on_doc(doc: &yrs::Doc, user_id: &str, client_id: ClientID) {
         // get_or_insert_map takes a write txn internally, call before any read txn.
         let users_map = doc.get_or_insert_map("users");
 
@@ -415,7 +487,7 @@ impl DocConnection {
             }
         }
 
-        let mut txn = doc.transact_mut();
+        let mut txn = doc.transact_mut_with(SERVER_ORIGIN.to_string());
 
         let user_map = match users_map.get(&txn, user_id) {
             Some(Out::YMap(m)) => m,
@@ -433,7 +505,7 @@ impl DocConnection {
         }
 
         ids_arr.push_back(&mut txn, yrs::Any::Number(client_id.get() as f64));
-        tracing::info!(
+        tracing::debug!(
             user_id,
             client_id = client_id.get(),
             "Registered client_id for user via server-driven PUD"
@@ -561,8 +633,11 @@ impl DocConnection {
                         let mut awareness = a.write().unwrap();
                         let sv_before = self.snapshot_sv(&awareness);
                         let ds_before = deleted_spans_by_client(&awareness.doc().transact());
-                        let result =
-                            protocol.handle_sync_step2(&mut awareness, Update::decode_v1(&update)?);
+                        let result = protocol.handle_sync_step2_by(
+                            &mut awareness,
+                            Update::decode_v1(&update)?,
+                            self.user.as_deref(),
+                        );
                         if result.is_ok() {
                             self.register_new_client_ids(&awareness, &sv_before);
                             self.log_large_deletion(&ds_before, &awareness);
@@ -587,8 +662,11 @@ impl DocConnection {
                         let mut awareness = a.write().unwrap();
                         let sv_before = self.snapshot_sv(&awareness);
                         let ds_before = deleted_spans_by_client(&awareness.doc().transact());
-                        let result =
-                            protocol.handle_update(&mut awareness, Update::decode_v1(&update)?);
+                        let result = protocol.handle_update_by(
+                            &mut awareness,
+                            Update::decode_v1(&update)?,
+                            self.user.as_deref(),
+                        );
                         if result.is_ok() {
                             self.register_new_client_ids(&awareness, &sv_before);
                             self.log_large_deletion(&ds_before, &awareness);
@@ -614,6 +692,20 @@ impl DocConnection {
                 protocol.handle_awareness_query(&awareness)
             }
             Message::Awareness(update) => {
+                // A solo entry describes its own sender; anything in a larger
+                // batch is a relayed echo and says nothing about the client
+                // that sent it.
+                if let Some(callback) = &self.on_client_version {
+                    let solo = update.clients.len() == 1;
+                    for (client_id, entry) in update.clients.iter() {
+                        callback(&AwarenessEntryFacts::from_entry(
+                            client_id.get(),
+                            &entry.json,
+                            solo,
+                        ));
+                    }
+                }
+
                 if update.clients.len() == 1 {
                     let client_id = update.clients.keys().next().unwrap();
                     self.client_id.get_or_init(|| *client_id);
