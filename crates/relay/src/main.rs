@@ -993,6 +993,7 @@ async fn main() -> Result<()> {
                 webhook_configs,
             )
             .await?
+            .with_allowed_client_versions(config.server.allowed_client_versions)
             .with_semantic_logging(config.server.semantic_logging)
             .with_user_names(
                 config
