@@ -25,7 +25,12 @@ use futures::{Sink, SinkExt, Stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, io::Write, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    io::Write,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 use tempfile::NamedTempFile;
 use tokio::{
     net::TcpListener,
@@ -65,6 +70,9 @@ const PONG_TIMEOUT: Duration = Duration::from_secs(40);
 /// full/recovered transition warns cover the common case; this distinguishes a
 /// client that is wedged for hours from one that stalled briefly.
 const CHANNEL_FULL_REWARN: Duration = Duration::from_secs(300);
+
+/// How often one user's version denial is logged, however often they retry.
+const DENIAL_LOG_INTERVAL: Duration = Duration::from_secs(1800);
 
 #[derive(Clone, Debug)]
 pub struct AllowedHost {
@@ -243,6 +251,10 @@ pub struct Server {
     event_dispatcher: Option<Arc<dyn EventDispatcher>>,
     sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
     metrics: Arc<RelayMetrics>,
+    /// Plugin versions permitted to open a doc websocket. Empty means no gating.
+    allowed_client_versions: HashSet<String>,
+    /// Per-user throttle for the denial warn, so a looping client cannot flood.
+    denial_log_throttle: Mutex<HashMap<String, DenialLogState>>,
     client_versions: Arc<ClientVersions>,
     vpath_index: Arc<VPathIndex>,
     /// Relay user id -> display name, for log readability only.
@@ -254,6 +266,12 @@ pub struct Server {
 /// Notified for each awareness entry, so a client id can be bound to the
 /// plugin build that sent it.
 type ClientVersionRecorder = Arc<dyn Fn(&AwarenessEntryFacts) + Send + Sync>;
+
+/// When this user's denial was last logged, and how many went unlogged since.
+struct DenialLogState {
+    last_logged: Instant,
+    suppressed: u64,
+}
 
 impl Server {
     pub async fn new(
@@ -321,6 +339,8 @@ impl Server {
             event_dispatcher,
             sync_protocol_event_sender,
             metrics,
+            allowed_client_versions: HashSet::new(),
+            denial_log_throttle: Mutex::new(HashMap::new()),
             client_versions: Arc::new(ClientVersions::new()),
             vpath_index: Arc::new(VPathIndex::default()),
             user_names: Arc::new(HashMap::new()),
@@ -328,6 +348,101 @@ impl Server {
             semantic_logging: false,
         })
     }
+
+    /// The allowlist in a stable order, for logs.
+    fn sorted_allowed_versions(&self) -> String {
+        let mut versions: Vec<&str> = self
+            .allowed_client_versions
+            .iter()
+            .map(String::as_str)
+            .collect();
+        versions.sort_unstable();
+        versions.join(",")
+    }
+
+    fn denial_log_permit(&self, user: &str) -> Option<u64> {
+        let mut throttle = self.denial_log_throttle.lock().unwrap();
+        match throttle.get_mut(user) {
+            Some(state) if state.last_logged.elapsed() < DENIAL_LOG_INTERVAL => {
+                state.suppressed += 1;
+                None
+            }
+            Some(state) => {
+                let suppressed = state.suppressed;
+                state.last_logged = Instant::now();
+                state.suppressed = 0;
+                Some(suppressed)
+            }
+            None => {
+                throttle.insert(
+                    user.to_string(),
+                    DenialLogState {
+                        last_logged: Instant::now(),
+                        suppressed: 0,
+                    },
+                );
+                Some(0)
+            }
+        }
+    }
+
+    fn check_client_version(
+        &self,
+        user: Option<&str>,
+        version: Option<&str>,
+    ) -> Result<(), AppError> {
+        let Some(user) = user else {
+            return Ok(());
+        };
+        if self.allowed_client_versions.is_empty() {
+            return Ok(());
+        }
+
+        match version {
+            Some(v) if self.allowed_client_versions.contains(v) => Ok(()),
+            _ => {
+                if let Some(suppressed) = self.denial_log_permit(user) {
+                    tracing::warn!(
+                        name = %self
+                            .user_names
+                            .get(user)
+                            .map(String::as_str)
+                            .unwrap_or("<none>"),
+                        user = %user,
+                        version = %version.unwrap_or("none"),
+                        allowed = %self.sorted_allowed_versions(),
+                        suppressed,
+                        interval_secs = DENIAL_LOG_INTERVAL.as_secs(),
+                        "Blocked user on client version"
+                    );
+                }
+                Err(AppError::auth(
+                    StatusCode::FORBIDDEN,
+                    anyhow!("This plugin version is temporarily blocked from sync; run witchdoctor to upgrade"),
+                    "client_version_blocked",
+                ))
+            }
+        }
+    }
+
+    /// Restrict doc websocket access to these plugin versions. Empty leaves
+    /// every version allowed; server tokens are exempt either way.
+    pub fn with_allowed_client_versions(
+        mut self,
+        versions: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.allowed_client_versions = versions.into_iter().collect();
+        if !self.allowed_client_versions.is_empty() {
+            // Sorted: the set's own order is the hash order, which scatters the
+            // versions and makes a reader hunt for the one they care about.
+            tracing::warn!(
+                "Requiring client version in [{}] for doc websocket access",
+                self.sorted_allowed_versions()
+            );
+        }
+        self
+    }
+
     /// Display names for log readability. Never consulted for authorization.
     pub fn with_user_names(mut self, names: impl IntoIterator<Item = (String, String)>) -> Self {
         let names: HashMap<String, String> = names.into_iter().collect();
@@ -1373,6 +1488,7 @@ async fn handle_socket_upgrade_deprecated(
     );
     let (authorization, channel, user) =
         verify_socket_token(&server_state, &doc_id, params.token.as_deref())?;
+    server_state.check_client_version(user.as_deref(), params.v.as_deref())?;
 
     let declared_client_ids = params.declared_client_ids();
     handle_socket_upgrade_with_channel_and_user(
@@ -1407,6 +1523,7 @@ async fn handle_socket_upgrade_full_path(
 
     let (authorization, channel, user) =
         verify_socket_token(&server_state, &doc_id, params.token.as_deref())?;
+    server_state.check_client_version(user.as_deref(), params.v.as_deref())?;
 
     let declared_client_ids = params.declared_client_ids();
     handle_socket_upgrade_with_channel_and_user(
@@ -5326,5 +5443,89 @@ async fn handle_file_download(
             StatusCode::BAD_REQUEST,
             anyhow!("Invalid permission type"),
         ))
+    }
+}
+
+#[cfg(test)]
+mod client_version_gate_tests {
+    use super::*;
+    use crate::test_util::test_server;
+
+    async fn gated(versions: &[&str]) -> Server {
+        test_server(
+            None,
+            Duration::from_secs(60),
+            false,
+            CancellationToken::new(),
+        )
+        .await
+        .with_allowed_client_versions(versions.iter().map(|v| v.to_string()))
+    }
+
+    #[tokio::test]
+    async fn an_allowed_version_passes() {
+        assert!(gated(&["0.8.10-th.1"])
+            .await
+            .check_client_version(Some("user-a"), Some("0.8.10-th.1"))
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_unlisted_version_is_forbidden() {
+        let err = gated(&["0.8.10-th.1"])
+            .await
+            .check_client_version(Some("user-a"), Some("0.8.9-th.1"))
+            .expect_err("an unlisted version must be refused");
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+    }
+
+    /// Clients older than 0.8.8 send no version at all. They are the reason the
+    /// gate exists, so absence must not read as "nothing to check".
+    #[tokio::test]
+    async fn a_client_reporting_no_version_is_forbidden() {
+        let err = gated(&["0.8.10-th.1"])
+            .await
+            .check_client_version(Some("user-a"), None)
+            .expect_err("a client that reports no version must be refused");
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+    }
+
+    /// Server tokens carry no user, and git-sync holds one. Gating them would
+    /// take down attribution sync rather than an out-of-date laptop.
+    #[tokio::test]
+    async fn a_server_token_is_exempt() {
+        assert!(gated(&["0.8.10-th.1"])
+            .await
+            .check_client_version(None, None)
+            .is_ok());
+    }
+
+    /// The default. An unconfigured server must let every client through.
+    /// The set's own iteration order is the hash order, which puts the fleet's
+    /// actual version in an arbitrary position and reads as though entries are
+    /// missing.
+    #[tokio::test]
+    async fn the_logged_allowlist_is_sorted() {
+        assert_eq!(
+            gated(&["0.8.12", "0.8.9-th.4", "0.8.10-th.1", "0.8.12-th.1"])
+                .await
+                .sorted_allowed_versions(),
+            "0.8.10-th.1,0.8.12,0.8.12-th.1,0.8.9-th.4"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_allowlist_gates_nothing() {
+        let server = test_server(
+            None,
+            Duration::from_secs(60),
+            false,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(server.check_client_version(Some("user-a"), None).is_ok());
+        assert!(server
+            .check_client_version(Some("user-a"), Some("0.0.1"))
+            .is_ok());
     }
 }

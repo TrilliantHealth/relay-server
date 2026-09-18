@@ -306,6 +306,13 @@ pub struct ServerConfig {
     #[serde(default = "default_redact_errors")]
     pub redact_errors: bool,
 
+    /// When non-empty, doc websocket connections must report one of these
+    /// plugin versions (`v` query param, sent by clients >= 0.8.8);
+    /// anything else - including clients too old to report - gets 403.
+    /// Server tokens are exempt. Empty = no version gating.
+    #[serde(default)]
+    pub allowed_client_versions: Vec<String>,
+
     /// Enables edit attribution logging, vpath resolution, folder membership
     /// change tracking, the /client-versions endpoint, and user display names
     /// in log lines. Default false: without it the server logs only opaque ids
@@ -627,6 +634,7 @@ impl Default for ServerConfig {
             checkpoint_freq_seconds: default_checkpoint_freq_seconds(),
             doc_gc: default_doc_gc(),
             redact_errors: default_redact_errors(),
+            allowed_client_versions: Vec::new(),
             semantic_logging: false,
             user_names: HashMap::new(),
         }
@@ -1352,6 +1360,36 @@ probe_prefix = "relay-probe/"
         );
         assert_eq!(s3.probe_prefix.as_deref(), Some("relay-probe/"));
     }
+    #[test]
+    fn allowed_client_versions_are_optional() {
+        let config: Config = toml::from_str(
+            r#"
+[server]
+url = "https://example.com"
+"#,
+        )
+        .expect("a config with no allowed_client_versions must still parse");
+
+        assert!(config.server.allowed_client_versions.is_empty());
+    }
+
+    #[test]
+    fn allowed_client_versions_parse() {
+        let config: Config = toml::from_str(
+            r#"
+[server]
+url = "https://example.com"
+allowed_client_versions = ["0.9.3", "0.9.2"]
+"#,
+        )
+        .expect("config with allowed_client_versions must parse");
+
+        assert_eq!(
+            config.server.allowed_client_versions,
+            vec!["0.9.3", "0.9.2"]
+        );
+    }
+
     #[test]
     fn user_names_parse_from_a_server_subtable() {
         let config: Config = toml::from_str(
