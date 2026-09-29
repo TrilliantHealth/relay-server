@@ -68,6 +68,20 @@ fn deleted_spans_by_client<T: ReadTxn>(txn: &T) -> std::collections::HashMap<Cli
         .collect()
 }
 
+/// Whether `update` deletes anything `txn`'s doc has not already deleted. A
+/// sync step carries the sender's whole delete set, so a replay of state the
+/// doc already has still arrives with a non-empty one.
+fn deletes_new_content<T: ReadTxn>(txn: &T, update: &Update) -> bool {
+    let known = txn.snapshot().delete_set;
+    update.delete_set().iter().any(|(client, ranges)| {
+        ranges.into_iter().filter(|r| !r.is_empty()).any(|r| {
+            !known
+                .get(client)
+                .is_some_and(|deleted| deleted.iter().any(|d| d.start <= r.start && r.end <= d.end))
+        })
+    })
+}
+
 /// Result of processing one message from a sync client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendOutcome {
@@ -176,6 +190,11 @@ pub struct DocConnection {
     /// Notified for each awareness entry, so the server can record which
     /// plugin build a client id belongs to.
     on_client_version: Option<ClientVersionCallback>,
+
+    /// Client ids the connecting plugin declared as its own, registered in the
+    /// PUD map only once this connection first changes the doc. Registering at
+    /// connect would write every doc a client merely syncs.
+    declared_client_ids: Mutex<Vec<ClientID>>,
 
     initial_sync: Mutex<InitialSync>,
 }
@@ -340,6 +359,7 @@ impl DocConnection {
             vpath: None,
             user_name: None,
             on_client_version: None,
+            declared_client_ids: Mutex::new(Vec::new()),
             initial_sync: Mutex::new(initial_sync),
         }
     }
@@ -381,6 +401,29 @@ impl DocConnection {
 
     pub fn set_on_client_version(&mut self, callback: ClientVersionCallback) {
         self.on_client_version = Some(callback);
+    }
+
+    pub fn set_declared_client_ids(&mut self, client_ids: Vec<ClientID>) {
+        self.declared_client_ids = Mutex::new(client_ids);
+    }
+
+    /// Register the declared client ids ahead of the first update that changes
+    /// the doc, so the update observer can already name its author.
+    fn register_declared_client_ids(&self, awareness: &Awareness, update: &Update) {
+        let Some(user_id) = &self.user else {
+            return;
+        };
+        let txn = awareness.doc().transact();
+        let changes_doc = update.extends(&txn.state_vector()) || deletes_new_content(&txn, update);
+        drop(txn);
+        if !changes_doc {
+            return;
+        }
+
+        let client_ids = std::mem::take(&mut *self.declared_client_ids.lock().unwrap());
+        for client_id in client_ids {
+            Self::register_pud_client_id_on_doc(awareness.doc(), user_id, client_id);
+        }
     }
 
     /// Log when this connection's update grew the doc's delete set by
@@ -631,11 +674,13 @@ impl DocConnection {
 
                     if can_write {
                         let mut awareness = a.write().unwrap();
+                        let update = Update::decode_v1(&update)?;
+                        self.register_declared_client_ids(&awareness, &update);
                         let sv_before = self.snapshot_sv(&awareness);
                         let ds_before = deleted_spans_by_client(&awareness.doc().transact());
                         let result = protocol.handle_sync_step2_by(
                             &mut awareness,
-                            Update::decode_v1(&update)?,
+                            update,
                             self.user.as_deref(),
                         );
                         if result.is_ok() {
@@ -660,13 +705,12 @@ impl DocConnection {
 
                     if can_write {
                         let mut awareness = a.write().unwrap();
+                        let update = Update::decode_v1(&update)?;
+                        self.register_declared_client_ids(&awareness, &update);
                         let sv_before = self.snapshot_sv(&awareness);
                         let ds_before = deleted_spans_by_client(&awareness.doc().transact());
-                        let result = protocol.handle_update_by(
-                            &mut awareness,
-                            Update::decode_v1(&update)?,
-                            self.user.as_deref(),
-                        );
+                        let result =
+                            protocol.handle_update_by(&mut awareness, update, self.user.as_deref());
                         if result.is_ok() {
                             self.register_new_client_ids(&awareness, &sv_before);
                             self.log_large_deletion(&ds_before, &awareness);
@@ -1693,5 +1737,107 @@ mod tests {
         // The full-scoped write was applied to the room document.
         let sv = awareness.read().unwrap().doc().transact().state_vector();
         assert!(!sv.is_empty(), "a full-token write must be applied");
+    }
+
+    fn pud_ids(awareness: &RwLock<Awareness>, user_id: &str) -> Vec<u64> {
+        let awareness = awareness.read().unwrap();
+        let txn = awareness.doc().transact();
+        crate::permanent_user_data::user_by_client(&txn)
+            .into_iter()
+            .filter(|(_, user)| user == user_id)
+            .map(|(client_id, _)| client_id)
+            .collect()
+    }
+
+    fn declaring_connection(awareness: Arc<RwLock<Awareness>>) -> DocConnection {
+        let mut connection = DocConnection::new(awareness, Authorization::Full, |_| {});
+        connection.set_user("alice".to_string());
+        connection.set_declared_client_ids(vec![ClientID::new(4242)]);
+        connection
+    }
+
+    #[test]
+    fn test_declared_client_ids_not_registered_by_sync_alone() {
+        let update = sample_update();
+        let doc = yrs::Doc::new();
+        doc.transact_mut()
+            .apply_update(Update::decode_v1(&update).unwrap())
+            .unwrap();
+        let awareness = Arc::new(RwLock::new(Awareness::new(doc)));
+        let connection = declaring_connection(awareness.clone());
+
+        // An idle client's step 2 and a resend of state the doc already has
+        // change nothing, so they must not write PermanentUserData.
+        for msg in [
+            SyncMessage::SyncStep2(Update::EMPTY_V1.to_vec()),
+            SyncMessage::SyncStep2(update.clone()),
+            SyncMessage::Update(update),
+        ] {
+            connection
+                .handle_msg(&DefaultProtocol, Message::Sync(msg))
+                .unwrap();
+        }
+
+        assert!(pud_ids(&awareness, "alice").is_empty());
+    }
+
+    /// An update written by `client_id`: an insert, then a deletion of part of it.
+    fn update_with_deletion(client_id: u64) -> Vec<u8> {
+        use yrs::Text;
+        let source = yrs::Doc::with_client_id(client_id);
+        let text = source.get_or_insert_text("contents");
+        text.insert(&mut source.transact_mut(), 0, "hello world");
+        text.remove_range(&mut source.transact_mut(), 5, 6);
+        let txn = source.transact();
+        txn.encode_state_as_update_v1(&yrs::StateVector::default())
+    }
+
+    #[test]
+    fn test_declared_client_ids_not_registered_by_replay_with_deletions() {
+        let update = update_with_deletion(7);
+        let doc = yrs::Doc::new();
+        doc.transact_mut()
+            .apply_update(Update::decode_v1(&update).unwrap())
+            .unwrap();
+        let awareness = Arc::new(RwLock::new(Awareness::new(doc)));
+        let connection = declaring_connection(awareness.clone());
+
+        // A reconnecting client's step 2 resends its whole delete set.
+        connection
+            .handle_msg(
+                &DefaultProtocol,
+                Message::Sync(SyncMessage::SyncStep2(update)),
+            )
+            .unwrap();
+
+        assert!(pud_ids(&awareness, "alice").is_empty());
+    }
+
+    #[test]
+    fn test_declared_client_ids_registered_before_first_change() {
+        let doc = yrs::Doc::new();
+        let authors = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let seen = authors.clone();
+        let _sub = doc
+            .observe_update_v1(move |txn, event| {
+                let author = crate::edit_author::user_for_update(txn, &event.update);
+                seen.lock().unwrap().push(author);
+            })
+            .unwrap();
+        let awareness = Arc::new(RwLock::new(Awareness::new(doc)));
+        let connection = declaring_connection(awareness.clone());
+
+        connection
+            .handle_msg(
+                &DefaultProtocol,
+                Message::Sync(SyncMessage::Update(update_with_deletion(4242))),
+            )
+            .unwrap();
+
+        assert_eq!(pud_ids(&awareness, "alice"), vec![4242]);
+        // The first observed update is the server's own PUD write; the
+        // client's edit comes next and already resolves to its user.
+        let authors = authors.lock().unwrap();
+        assert_eq!(authors.get(1), Some(&Some("alice".to_string())));
     }
 }
