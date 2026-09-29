@@ -1279,10 +1279,10 @@ async fn handle_socket_upgrade_with_channel_and_user(
 
     // A client that names its own ids lets us bind them to the version it
     // reported, rather than inferring from whichever connection was seen
-    // first. Register them under the user at the same time: doing it here,
-    // once per connection, keeps PermanentUserData writes off the awareness
-    // path, where a write lock per message serialized against sync.
-    if let (Some(v), Some(user_id)) = (version.as_deref(), user_for_pud.as_deref()) {
+    // first. The connection registers them in PermanentUserData only when it
+    // first changes the doc.
+    let mut pud_client_ids = Vec::new();
+    if let (Some(v), Some(_)) = (version.as_deref(), user_for_pud.as_deref()) {
         for client_id in declared_client_ids {
             if let Some(recorded) =
                 server_state
@@ -1300,13 +1300,7 @@ async fn handle_socket_upgrade_with_channel_and_user(
             }
             // Server-generated ids are 53-bit; a real client id is not.
             if client_id >> 53 == 0 {
-                if let Ok(awareness) = guard.doc().awareness().read() {
-                    DocConnection::register_pud_client_id_on_doc(
-                        awareness.doc(),
-                        user_id,
-                        yrs::block::ClientID::new(client_id),
-                    );
-                }
+                pud_client_ids.push(yrs::block::ClientID::new(client_id));
             }
         }
     }
@@ -1362,6 +1356,7 @@ async fn handle_socket_upgrade_with_channel_and_user(
             vpath,
             user_name,
             record_client_version,
+            pud_client_ids,
         )
     }))
 }
@@ -1554,6 +1549,7 @@ async fn handle_socket(
     vpath: Option<String>,
     user_name: Option<String>,
     record_client_version: ClientVersionRecorder,
+    pud_client_ids: Vec<yrs::block::ClientID>,
 ) {
     let (sink, stream) = socket.split();
     handle_socket_inner(
@@ -1570,6 +1566,7 @@ async fn handle_socket(
         vpath,
         user_name,
         record_client_version,
+        pud_client_ids,
     )
     .await
 }
@@ -1592,6 +1589,7 @@ async fn handle_socket_inner<S, T, E>(
     vpath: Option<String>,
     user_name: Option<String>,
     record_client_version: ClientVersionRecorder,
+    pud_client_ids: Vec<yrs::block::ClientID>,
 ) where
     S: Sink<Message> + Send + Unpin + 'static,
     T: Stream<Item = Result<Message, E>> + Unpin,
@@ -1700,6 +1698,7 @@ async fn handle_socket_inner<S, T, E>(
     conn.set_sync_kv(sync_kv);
     conn.set_doc_id(doc_id.clone());
     conn.set_on_client_version(Box::new(move |facts| record_client_version(facts)));
+    conn.set_declared_client_ids(pud_client_ids);
     if let Some(vpath) = vpath {
         conn.set_vpath(vpath);
     }
@@ -4268,6 +4267,7 @@ mod test {
                 None,
                 None,
                 Arc::new(|_| {}),
+                Vec::new(),
             ));
 
             SocketHarness {
