@@ -580,6 +580,7 @@ impl Server {
         doc_id: &str,
         routing_channel: Option<String>,
         user: Option<String>,
+        kind: Option<AttachKind>,
     ) -> Result<DocWithSyncKv> {
         // Routing is decided once the doc has loaded, because a load that
         // names no channel routes by the channel stored in the doc's own
@@ -792,8 +793,17 @@ impl Server {
         // Without it, the first channel-less load would route the doc to
         // itself for as long as it stays resident, and the parent folder's
         // subscribers would miss every edit made in that time.
-        let routing_channel =
-            routing_channel.or_else(|| dwskv.get_channel().filter(|channel| channel != doc_id));
+        //
+        // A parent pin never takes the stored channel: a parent routes only
+        // to itself, which bounds the recursion below at one level and keeps
+        // the slot-lock order acyclic even if a parent's metadata names
+        // another doc.
+        let routing_channel = routing_channel.or_else(|| {
+            if kind == Some(AttachKind::Subdoc) {
+                return None;
+            }
+            dwskv.get_channel().filter(|channel| channel != doc_id)
+        });
         let routing_channel_name = routing_channel
             .clone()
             .unwrap_or_else(|| doc_id.to_string());
@@ -858,7 +868,7 @@ impl Server {
                 let user = user.clone();
                 async move {
                     tracing::debug!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc");
-                    self.build_doc(doc_id, routing_channel, user).await
+                    self.build_doc(doc_id, routing_channel, user, None).await
                 }
             })
             .await
@@ -882,7 +892,7 @@ impl Server {
                 let user = user.clone();
                 async move {
                     tracing::debug!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc");
-                    self.build_doc(doc_id, routing_channel, user).await
+                    self.build_doc(doc_id, routing_channel, user, Some(kind)).await
                 }
             })
             .await
@@ -890,9 +900,9 @@ impl Server {
 
     /// Boxed form of [`Self::attach_doc`] for use inside `build_doc`,
     /// which recursively calls it to pin a subdoc's parent. The recursion
-    /// terminates because a parent never routes to another channel, and
-    /// no lock cycle exists because parent loads take only the parent's
-    /// own slot lock.
+    /// terminates because a parent never routes to another channel (a
+    /// `Subdoc` load ignores any stored channel), and no lock cycle exists
+    /// because parent loads take only the parent's own slot lock.
     fn attach_doc_boxed<'a>(
         &'a self,
         doc_id: &'a str,
@@ -4007,6 +4017,83 @@ mod test {
             assert!(
                 index_moved,
                 "the folder's subdoc index must take an edit made after an attributed-content read"
+            );
+        }
+
+        /// A parent pin routes only to itself, even when its own metadata
+        /// stores another doc's channel (left by a mis-scoped token).
+        /// Following that channel would send the folder's own index edits
+        /// to a different folder's subscribers.
+        #[tokio::test(start_paused = true)]
+        async fn a_parent_pin_ignores_a_stored_channel() {
+            let (server, listener) = server_with_listener().await;
+            let other_folder = "other-folder";
+
+            // FOLDER's doc is read once with a token naming another folder.
+            drop(
+                server
+                    .attach_doc(
+                        FOLDER,
+                        AttachKind::Http,
+                        Some(other_folder.to_string()),
+                        None,
+                    )
+                    .await
+                    .unwrap(),
+            );
+            settle().await;
+            assert_eq!(server.registry.evict(FOLDER).await, EvictOutcome::Evicted);
+            assert_eq!(
+                server.registry.evict(other_folder).await,
+                EvictOutcome::Evicted
+            );
+            settle().await;
+
+            // A folder member opens a note, which pins FOLDER as its parent.
+            let _note = server
+                .attach_doc(NOTE, AttachKind::Socket, Some(FOLDER.to_string()), None)
+                .await
+                .unwrap();
+            settle().await;
+            listener.clear();
+
+            let folder = server
+                .registry
+                .peek(FOLDER)
+                .expect("the parent pin loads the folder");
+            folder
+                .apply_update(&content_update("index", "entry"))
+                .unwrap();
+            settle().await;
+
+            assert!(
+                listener.heard(FOLDER, FOLDER),
+                "the folder's own edit must route to the folder"
+            );
+            assert!(
+                !listener.heard(other_folder, FOLDER),
+                "the folder's own edit must not reach the folder its metadata names"
+            );
+        }
+
+        /// A load that names one of its own subdocs as its channel pins that
+        /// subdoc as a parent. The pin must not follow the subdoc's stored
+        /// channel back to the doc whose slot the outer load holds.
+        #[tokio::test(start_paused = true)]
+        async fn a_parent_pin_naming_the_loading_doc_does_not_deadlock() {
+            let (server, _listener) = server_with_listener().await;
+            note_stored_under_folder_then_evicted(&server).await;
+            assert_eq!(server.registry.evict(FOLDER).await, EvictOutcome::Evicted);
+            settle().await;
+
+            let load = tokio::time::timeout(
+                Duration::from_secs(30),
+                server.attach_doc(FOLDER, AttachKind::Socket, Some(NOTE.to_string()), None),
+            )
+            .await;
+            assert!(
+                load.is_ok(),
+                "loading the folder with its note's channel must not wait on itself"
             );
         }
     }
