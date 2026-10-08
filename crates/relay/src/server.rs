@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     io::Write,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 use tempfile::NamedTempFile;
@@ -271,6 +271,13 @@ type ClientVersionRecorder = Arc<dyn Fn(&AwarenessEntryFacts) + Send + Sync>;
 struct DenialLogState {
     last_logged: Instant,
     suppressed: u64,
+}
+
+/// Where a resident doc's events go: its routing channel, and the pin on
+/// the parent folder when that channel is not the doc itself.
+struct DocRouting {
+    channel: String,
+    parent_guard: Option<AttachGuard>,
 }
 
 impl Server {
@@ -573,31 +580,19 @@ impl Server {
         doc_id: &str,
         routing_channel: Option<String>,
         user: Option<String>,
+        kind: Option<AttachKind>,
     ) -> Result<DocWithSyncKv> {
-        // Determine routing channel: use provided channel or fallback to doc_id
-        let routing_channel_name = routing_channel
-            .clone()
-            .unwrap_or_else(|| doc_id.to_string());
+        // Routing is decided once the doc has loaded, because a load that
+        // names no channel routes by the channel stored in the doc's own
+        // metadata. The event callback must exist before the load, so it
+        // reads the routing from this cell; the cell is set before the doc
+        // is returned to the registry, so no other caller can edit it first.
+        let routing: Arc<OnceLock<DocRouting>> = Arc::new(OnceLock::new());
 
-        // If this doc routes to a different channel (i.e., it's a subdoc),
-        // load the parent and pin it with an explicit Subdoc attachment:
-        // the guard both counts on the parent's actor and holds a parent
-        // awareness ref (which the strong-count probes still key on).
-        // Lock order is strictly child slot → parent slot, and parents
-        // never route elsewhere, so no cycle exists.
-        let parent_guard = if routing_channel_name != doc_id {
-            Some(
-                self.attach_doc_boxed(&routing_channel_name, AttachKind::Subdoc)
-                    .await?,
-            )
-        } else {
-            None
-        };
-
-        // Create event callback with the determined routing channel and user
+        // Create event callback with the routing decided below and the user
         let event_callback = {
             let event_dispatcher = self.event_dispatcher.clone();
-            let routing_channel_for_callback = routing_channel_name.clone();
+            let routing_for_callback = routing.clone();
             let user_for_callback = user.clone();
             let doc_id_for_callback = doc_id.to_string();
             let registry = self.registry.clone();
@@ -606,12 +601,21 @@ impl Server {
             let edit_bursts = self.edit_bursts.clone();
             let client_versions = self.client_versions.clone();
             let semantic = self.semantic_logging;
-            // The parent pin lives in this closure, which the doc owns via
-            // its SyncKv observer: the guard detaches when the doc drops.
-            let parent_guard = parent_guard;
+            // The parent pin lives in the routing cell, which this closure
+            // shares and the doc owns via its SyncKv observer: the guard
+            // detaches when the doc drops.
 
             if let Some(dispatcher) = event_dispatcher {
                 Some(Arc::new(move |mut event: DocumentUpdatedEvent| {
+                    // Unset only for an update applied while the doc is
+                    // still loading, which no client can send yet; it routes
+                    // to the doc itself, as a channel-less load would.
+                    let (routing_channel_for_callback, parent_guard) = match routing_for_callback
+                        .get()
+                    {
+                        Some(routing) => (routing.channel.clone(), routing.parent_guard.as_ref()),
+                        None => (doc_id_for_callback.clone(), None),
+                    };
                     // The doc's update observer already resolved the editing
                     // user from the update itself. The identity captured when
                     // this doc was first loaded is only a stand-in for updates
@@ -631,7 +635,7 @@ impl Server {
                     // Route this subdoc's snapshot through the parent's
                     // actor mailbox — cross-doc mutation stays with the
                     // owner. The guard doubles as the parent pin.
-                    if let Some(parent_guard) = &parent_guard {
+                    if let Some(parent_guard) = parent_guard {
                         if let Some(snapshot) = &event.snapshot {
                             parent_guard.send_subdoc_snapshot(
                                 doc_id_for_callback.clone(),
@@ -784,7 +788,46 @@ impl Server {
         // this doc's lifecycle actor and points the edge at its mailbox.
         let dwskv = DocWithSyncKv::new(doc_id, self.store.clone(), || (), event_callback).await?;
 
-        // If channel is provided in token, store it in document metadata
+        // A load that names no channel (a token without a channel claim, or
+        // a route that passes none) uses the channel an earlier load stored.
+        // Without it, the first channel-less load would route the doc to
+        // itself for as long as it stays resident, and the parent folder's
+        // subscribers would miss every edit made in that time.
+        //
+        // A parent pin never takes the stored channel: a parent routes only
+        // to itself, which bounds the recursion below at one level and keeps
+        // the slot-lock order acyclic even if a parent's metadata names
+        // another doc.
+        let routing_channel = routing_channel.or_else(|| {
+            if kind == Some(AttachKind::Subdoc) {
+                return None;
+            }
+            dwskv.get_channel().filter(|channel| channel != doc_id)
+        });
+        let routing_channel_name = routing_channel
+            .clone()
+            .unwrap_or_else(|| doc_id.to_string());
+
+        // If this doc routes to a different channel (i.e., it's a subdoc),
+        // load the parent and pin it with an explicit Subdoc attachment:
+        // the guard both counts on the parent's actor and holds a parent
+        // awareness ref (which the strong-count probes still key on).
+        // Lock order is strictly child slot → parent slot, and parents
+        // never route elsewhere, so no cycle exists.
+        let parent_guard = if routing_channel_name != doc_id {
+            Some(
+                self.attach_doc_boxed(&routing_channel_name, AttachKind::Subdoc)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let _ = routing.set(DocRouting {
+            channel: routing_channel_name,
+            parent_guard,
+        });
+
+        // Store the routing channel in document metadata
         if let Some(channel_name) = routing_channel {
             dwskv.set_channel(&channel_name);
         }
@@ -825,7 +868,7 @@ impl Server {
                 let user = user.clone();
                 async move {
                     tracing::debug!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc");
-                    self.build_doc(doc_id, routing_channel, user).await
+                    self.build_doc(doc_id, routing_channel, user, None).await
                 }
             })
             .await
@@ -849,7 +892,7 @@ impl Server {
                 let user = user.clone();
                 async move {
                     tracing::debug!(doc_id=?doc_id, channel=?routing_channel, user=?user, "Loading doc");
-                    self.build_doc(doc_id, routing_channel, user).await
+                    self.build_doc(doc_id, routing_channel, user, Some(kind)).await
                 }
             })
             .await
@@ -857,9 +900,9 @@ impl Server {
 
     /// Boxed form of [`Self::attach_doc`] for use inside `build_doc`,
     /// which recursively calls it to pin a subdoc's parent. The recursion
-    /// terminates because a parent never routes to another channel, and
-    /// no lock cycle exists because parent loads take only the parent's
-    /// own slot lock.
+    /// terminates because a parent never routes to another channel (a
+    /// `Subdoc` load ignores any stored channel), and no lock cycle exists
+    /// because parent loads take only the parent's own slot lock.
     fn attach_doc_boxed<'a>(
         &'a self,
         doc_id: &'a str,
@@ -3810,6 +3853,247 @@ mod test {
                 capture.last_user(),
                 Some("editor".to_string()),
                 "the event must name the client that authored the update"
+            );
+        }
+    }
+
+    /// A doc's routing channel is fixed when it loads, and a resident doc
+    /// keeps it until eviction. A read that names no channel - a token
+    /// without a channel claim, or a route that passes none - must still
+    /// route the note to the folder it was stored under, or the folder's
+    /// subscribers miss every edit made while it stays resident.
+    mod channel_less_loads {
+        use super::*;
+        use crate::doc_lifecycle::EvictOutcome;
+        use crate::test_util::{content_update, test_server};
+        use std::sync::Mutex;
+        use y_sweet_core::event::{EventDispatcher, EventEnvelope};
+        use y_sweet_core::store::memory::MemoryStore;
+
+        const FOLDER: &str = "relay-folder";
+        const NOTE: &str = "relay-note";
+
+        /// Stands in for a folder subscriber such as Git Sync: it hears
+        /// the events dispatched on each channel.
+        #[derive(Default)]
+        struct ChannelListener {
+            envelopes: Mutex<Vec<EventEnvelope>>,
+        }
+
+        impl ChannelListener {
+            fn heard(&self, channel: &str, doc_id: &str) -> bool {
+                self.envelopes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.channel == channel && e.event.doc_id == doc_id)
+            }
+
+            fn clear(&self) {
+                self.envelopes.lock().unwrap().clear();
+            }
+        }
+
+        impl EventDispatcher for ChannelListener {
+            fn send_event(&self, envelope: EventEnvelope) {
+                self.envelopes.lock().unwrap().push(envelope);
+            }
+            fn shutdown(&self) {}
+        }
+
+        async fn server_with_listener() -> (Arc<Server>, Arc<ChannelListener>) {
+            let mut server = test_server(
+                Some(Box::new(MemoryStore::new())),
+                Duration::from_secs(600),
+                false,
+                CancellationToken::new(),
+            )
+            .await;
+            let listener = Arc::new(ChannelListener::default());
+            server.event_dispatcher = Some(listener.clone() as Arc<dyn EventDispatcher>);
+            (Arc::new(server), listener)
+        }
+
+        async fn settle() {
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        /// The folder's subdoc index, which subscribers compare on reconnect.
+        fn folder_subdoc_index(server: &Server) -> Option<ciborium::value::Value> {
+            server
+                .registry
+                .peek(FOLDER)?
+                .sync_kv()
+                .get_metadata()?
+                .get("subdocs")
+                .cloned()
+        }
+
+        /// A folder member opens the note, edits it and leaves, and the
+        /// note is evicted, so the next load decides its routing afresh.
+        async fn note_stored_under_folder_then_evicted(server: &Server) {
+            let guard = server
+                .attach_doc(NOTE, AttachKind::Socket, Some(FOLDER.to_string()), None)
+                .await
+                .unwrap();
+            guard
+                .doc()
+                .apply_update(&content_update("k", "first"))
+                .unwrap();
+            drop(guard);
+            settle().await;
+            assert_eq!(server.registry.evict(NOTE).await, EvictOutcome::Evicted);
+            settle().await;
+            assert!(!server.registry.is_resident(NOTE));
+        }
+
+        /// A folder member edits the now-resident note. Returns whether the
+        /// folder channel heard the edit and whether the folder's subdoc
+        /// index moved.
+        async fn folder_member_edits(server: &Server, listener: &ChannelListener) -> (bool, bool) {
+            listener.clear();
+            let index_before = folder_subdoc_index(server);
+            let guard = server
+                .attach_doc(NOTE, AttachKind::Socket, Some(FOLDER.to_string()), None)
+                .await
+                .unwrap();
+            guard
+                .doc()
+                .apply_update(&content_update("k", "second"))
+                .unwrap();
+            settle().await;
+            (
+                listener.heard(FOLDER, NOTE),
+                folder_subdoc_index(server) != index_before,
+            )
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_channel_less_read_keeps_the_note_routed_to_its_folder() {
+            let (server, listener) = server_with_listener().await;
+            note_stored_under_folder_then_evicted(&server).await;
+
+            // No authenticator is configured, so this read is authorized
+            // and carries no channel, like a prefix token without a claim.
+            get_doc_as_update(State(server.clone()), Path(NOTE.to_string()), None)
+                .await
+                .unwrap();
+            assert!(server.registry.is_resident(NOTE));
+
+            let (heard, index_moved) = folder_member_edits(&server, &listener).await;
+            assert!(
+                heard,
+                "the folder channel must hear an edit made after a channel-less read"
+            );
+            assert!(
+                index_moved,
+                "the folder's subdoc index must take an edit made after a channel-less read"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn an_attributed_content_read_keeps_the_note_routed_to_its_folder() {
+            let (server, listener) = server_with_listener().await;
+            note_stored_under_folder_then_evicted(&server).await;
+
+            // The route never passes a channel. Its answer (here a 404: the
+            // note has no text root) does not matter; the load does.
+            let _ = get_doc_attributed_content(
+                State(server.clone()),
+                Path(NOTE.to_string()),
+                Query(AttributedContentParams { root: None }),
+                None,
+            )
+            .await;
+            assert!(server.registry.is_resident(NOTE));
+
+            let (heard, index_moved) = folder_member_edits(&server, &listener).await;
+            assert!(
+                heard,
+                "the folder channel must hear an edit made after an attributed-content read"
+            );
+            assert!(
+                index_moved,
+                "the folder's subdoc index must take an edit made after an attributed-content read"
+            );
+        }
+
+        /// A parent pin routes only to itself, even when its own metadata
+        /// stores another doc's channel (left by a mis-scoped token).
+        /// Following that channel would send the folder's own index edits
+        /// to a different folder's subscribers.
+        #[tokio::test(start_paused = true)]
+        async fn a_parent_pin_ignores_a_stored_channel() {
+            let (server, listener) = server_with_listener().await;
+            let other_folder = "other-folder";
+
+            // FOLDER's doc is read once with a token naming another folder.
+            drop(
+                server
+                    .attach_doc(
+                        FOLDER,
+                        AttachKind::Http,
+                        Some(other_folder.to_string()),
+                        None,
+                    )
+                    .await
+                    .unwrap(),
+            );
+            settle().await;
+            assert_eq!(server.registry.evict(FOLDER).await, EvictOutcome::Evicted);
+            assert_eq!(
+                server.registry.evict(other_folder).await,
+                EvictOutcome::Evicted
+            );
+            settle().await;
+
+            // A folder member opens a note, which pins FOLDER as its parent.
+            let _note = server
+                .attach_doc(NOTE, AttachKind::Socket, Some(FOLDER.to_string()), None)
+                .await
+                .unwrap();
+            settle().await;
+            listener.clear();
+
+            let folder = server
+                .registry
+                .peek(FOLDER)
+                .expect("the parent pin loads the folder");
+            folder
+                .apply_update(&content_update("index", "entry"))
+                .unwrap();
+            settle().await;
+
+            assert!(
+                listener.heard(FOLDER, FOLDER),
+                "the folder's own edit must route to the folder"
+            );
+            assert!(
+                !listener.heard(other_folder, FOLDER),
+                "the folder's own edit must not reach the folder its metadata names"
+            );
+        }
+
+        /// A load that names one of its own subdocs as its channel pins that
+        /// subdoc as a parent. The pin must not follow the subdoc's stored
+        /// channel back to the doc whose slot the outer load holds.
+        #[tokio::test(start_paused = true)]
+        async fn a_parent_pin_naming_the_loading_doc_does_not_deadlock() {
+            let (server, _listener) = server_with_listener().await;
+            note_stored_under_folder_then_evicted(&server).await;
+            assert_eq!(server.registry.evict(FOLDER).await, EvictOutcome::Evicted);
+            settle().await;
+
+            let load = tokio::time::timeout(
+                Duration::from_secs(30),
+                server.attach_doc(FOLDER, AttachKind::Socket, Some(NOTE.to_string()), None),
+            )
+            .await;
+            assert!(
+                load.is_ok(),
+                "loading the folder with its note's channel must not wait on itself"
             );
         }
     }
