@@ -1,6 +1,7 @@
 use crate::client_versions::{self, ClientVersions, Observation};
 use crate::doc_lifecycle::{AttachGuard, AttachKind, DocRegistry, LifecycleConfig};
 use crate::edit_bursts::{self, Edit, EditBursts, Verdict};
+use crate::load_dependencies::LoadDependencies;
 use crate::vpath_index::VPathIndex;
 use anyhow::{anyhow, Result};
 use axum::{
@@ -239,6 +240,7 @@ pub struct Server {
     /// Owner of document identity: single-flight loads, eviction under
     /// the slot lock, slots reclaimed at eviction and on failed loads.
     registry: Arc<DocRegistry>,
+    load_dependencies: LoadDependencies,
     store: Option<Arc<Box<dyn Store>>>,
     authenticator: Option<Authenticator>,
     url: Option<Url>,
@@ -337,6 +339,7 @@ impl Server {
                     doc_gc,
                 },
             )),
+            load_dependencies: LoadDependencies::default(),
             store: store.map(Arc::new),
             authenticator,
             url,
@@ -795,9 +798,7 @@ impl Server {
         // subscribers would miss every edit made in that time.
         //
         // A parent pin never takes the stored channel: a parent routes only
-        // to itself, which bounds the recursion below at one level and keeps
-        // the slot-lock order acyclic even if a parent's metadata names
-        // another doc.
+        // to itself, which bounds recursive loading at one level.
         let routing_channel = routing_channel.or_else(|| {
             if kind == Some(AttachKind::Subdoc) {
                 return None;
@@ -812,9 +813,12 @@ impl Server {
         // load the parent and pin it with an explicit Subdoc attachment:
         // the guard both counts on the parent's actor and holds a parent
         // awareness ref (which the strong-count probes still key on).
-        // Lock order is strictly child slot → parent slot, and parents
-        // never route elsewhere, so no cycle exists.
+        // Another ordinary loader may already own the parent slot and
+        // follow its metadata, so reject cyclic waits before awaiting it.
         let parent_guard = if routing_channel_name != doc_id {
+            let _dependency = self
+                .load_dependencies
+                .begin(doc_id, &routing_channel_name)?;
             Some(
                 self.attach_doc_boxed(&routing_channel_name, AttachKind::Subdoc)
                     .await?,
@@ -900,9 +904,8 @@ impl Server {
 
     /// Boxed form of [`Self::attach_doc`] for use inside `build_doc`,
     /// which recursively calls it to pin a subdoc's parent. The recursion
-    /// terminates because a parent never routes to another channel (a
-    /// `Subdoc` load ignores any stored channel), and no lock cycle exists
-    /// because parent loads take only the parent's own slot lock.
+    /// terminates because a parent pin does not follow stored routing.
+    /// Concurrent ordinary loads are checked by `load_dependencies`.
     fn attach_doc_boxed<'a>(
         &'a self,
         doc_id: &'a str,
@@ -4074,6 +4077,78 @@ mod test {
                 !listener.heard(other_folder, FOLDER),
                 "the folder's own edit must not reach the folder its metadata names"
             );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn concurrent_stored_channel_cycle_completes() {
+            let (server, listener) = server_with_listener().await;
+            // Seed metadata without loading either registry slot.
+            for (id, channel) in [(NOTE, FOLDER), (FOLDER, NOTE)] {
+                let doc = DocWithSyncKv::new(id, server.store.clone(), || (), None)
+                    .await
+                    .unwrap();
+                doc.set_channel(channel);
+                doc.sync_kv().persist().await.unwrap();
+            }
+            // Both ordinary loads own their slots before resolving metadata.
+            let barrier = tokio::sync::Barrier::new(2);
+            let a = server.registry.get_or_load(NOTE, || async {
+                barrier.wait().await;
+                server.build_doc(NOTE, None, None, None).await
+            });
+            let b = server.registry.get_or_load(FOLDER, || async {
+                barrier.wait().await;
+                server.build_doc(FOLDER, None, None, None).await
+            });
+            let result =
+                tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(a, b) }).await;
+            let (a, b) = result.expect("concurrent stored-channel loads must not deadlock");
+            assert_ne!(a.is_ok(), b.is_ok(), "one cyclic loader must be rejected");
+            let (doc, error, doc_id, parent_id) = match (a, b) {
+                (Ok(doc), Err(error)) => (doc, error, NOTE, FOLDER),
+                (Err(error), Ok(doc)) => (doc, error, FOLDER, NOTE),
+                _ => unreachable!(),
+            };
+            assert!(error.to_string().contains("document load dependency cycle"));
+            let parent = server.registry.peek(parent_id).unwrap();
+            let index_before = parent
+                .sync_kv()
+                .get_metadata()
+                .and_then(|metadata| metadata.get("subdocs").cloned());
+            listener.clear();
+            doc.apply_update(&content_update("k", "after-cycle"))
+                .unwrap();
+            settle().await;
+            assert!(listener.heard(parent_id, doc_id));
+            assert_ne!(
+                parent
+                    .sync_kv()
+                    .get_metadata()
+                    .and_then(|metadata| metadata.get("subdocs").cloned()),
+                index_before
+            );
+            assert!(server.registry.is_resident(NOTE));
+            assert!(server.registry.is_resident(FOLDER));
+            let _dependency = server.load_dependencies.begin(FOLDER, NOTE).unwrap();
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn explicit_channel_wins_over_stored_channel() {
+            let (server, listener) = server_with_listener().await;
+            note_stored_under_folder_then_evicted(&server).await;
+            listener.clear();
+            let guard = server
+                .attach_doc(NOTE, AttachKind::Http, Some("new-folder".to_string()), None)
+                .await
+                .unwrap();
+            assert_eq!(guard.doc().get_channel().as_deref(), Some("new-folder"));
+            guard
+                .doc()
+                .apply_update(&content_update("k", "second"))
+                .unwrap();
+            settle().await;
+            assert!(listener.heard("new-folder", NOTE));
+            assert!(!listener.heard(FOLDER, NOTE));
         }
 
         /// A load that names one of its own subdocs as its channel pins that
