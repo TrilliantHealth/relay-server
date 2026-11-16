@@ -5,6 +5,7 @@ pub mod cwt;
 pub mod doc_connection;
 pub mod doc_sync;
 pub mod event;
+pub mod jwt;
 pub mod metrics;
 pub mod permanent_user_data;
 pub mod store;
