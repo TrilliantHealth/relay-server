@@ -10,7 +10,20 @@ use crate::webhook::WebhookConfig as CoreWebhookConfig;
 struct EnvOverride {
     env_var: &'static str,
     config_path: &'static str,
+    /// The value is a credential, so it is never logged.
+    secret: bool,
     apply: fn(&mut Config, &str) -> Result<(), ConfigError>,
+}
+
+impl EnvOverride {
+    /// The value as it may appear in logs.
+    fn loggable<'a>(&self, value: &'a str) -> &'a str {
+        if self.secret {
+            "<redacted>"
+        } else {
+            value
+        }
+    }
 }
 
 // Centralized override table - single source of truth
@@ -18,6 +31,7 @@ static ENV_OVERRIDES: &[EnvOverride] = &[
     EnvOverride {
         env_var: "RELAY_SERVER_HOST",
         config_path: "server.host",
+        secret: false,
         apply: |config, value| {
             config.server.host = value.to_string();
             Ok(())
@@ -26,6 +40,7 @@ static ENV_OVERRIDES: &[EnvOverride] = &[
     EnvOverride {
         env_var: "PORT",
         config_path: "server.port",
+        secret: false,
         apply: |config, value| {
             config.server.port = value
                 .parse()
@@ -36,6 +51,7 @@ static ENV_OVERRIDES: &[EnvOverride] = &[
     EnvOverride {
         env_var: "METRICS_PORT",
         config_path: "metrics.port",
+        secret: false,
         apply: |config, value| {
             let port: u16 = value
                 .parse()
@@ -51,6 +67,7 @@ static ENV_OVERRIDES: &[EnvOverride] = &[
     EnvOverride {
         env_var: "RELAY_SERVER_URL",
         config_path: "server.url",
+        secret: false,
         apply: |config, value| {
             config.server.url = Some(value.to_string());
             Ok(())
@@ -59,6 +76,7 @@ static ENV_OVERRIDES: &[EnvOverride] = &[
     EnvOverride {
         env_var: "RELAY_SERVER_CHECKPOINT_FREQ_SECONDS",
         config_path: "server.checkpoint_freq_seconds",
+        secret: false,
         apply: |config, value| {
             let freq: u64 = value.parse().map_err(|_| {
                 ConfigError::InvalidConfiguration(format!(
@@ -73,6 +91,7 @@ static ENV_OVERRIDES: &[EnvOverride] = &[
     EnvOverride {
         env_var: "RELAY_SERVER_DOC_GC",
         config_path: "server.doc_gc",
+        secret: false,
         apply: |config, value| {
             let gc_enabled = match value.to_lowercase().as_str() {
                 "true" | "1" | "yes" => true,
@@ -91,6 +110,7 @@ static ENV_OVERRIDES: &[EnvOverride] = &[
     EnvOverride {
         env_var: "RELAY_SERVER_REDACT_ERRORS",
         config_path: "server.redact_errors",
+        secret: false,
         apply: |config, value| {
             let redact = match value.to_lowercase().as_str() {
                 "true" | "1" | "yes" => true,
@@ -109,6 +129,7 @@ static ENV_OVERRIDES: &[EnvOverride] = &[
     EnvOverride {
         env_var: "RELAY_SERVER_ALLOWED_HOSTS",
         config_path: "server.allowed_hosts",
+        secret: false,
         apply: |config, value| {
             let hosts: Vec<String> = value.split(',').map(|s| s.trim().to_string()).collect();
             let parsed_hosts = Config::parse_allowed_hosts(hosts)?;
@@ -119,6 +140,7 @@ static ENV_OVERRIDES: &[EnvOverride] = &[
     EnvOverride {
         env_var: "RELAY_SERVER_AUTH",
         config_path: "auth",
+        secret: true,
         apply: |config, value| {
             let key_id = std::env::var("RELAY_SERVER_KEY_ID").ok();
             let (key, allowed_token_types) = parse_auth_env_value(value)?;
@@ -142,6 +164,7 @@ static ENV_OVERRIDES: &[EnvOverride] = &[
     EnvOverride {
         env_var: "RELAY_SERVER_STORAGE",
         config_path: "store",
+        secret: false,
         apply: |config, value| {
             if value.starts_with("s3://") {
                 let url = Url::parse(value).map_err(|_| {
@@ -186,6 +209,7 @@ static ENV_OVERRIDES: &[EnvOverride] = &[
     EnvOverride {
         env_var: "RELAY_SERVER_WEBHOOK_CONFIG",
         config_path: "webhooks",
+        secret: true,
         apply: |config, value| {
             let webhooks: Vec<CoreWebhookConfig> = serde_json::from_str(value).map_err(|e| {
                 ConfigError::InvalidConfiguration(format!("Invalid webhook config JSON: {}", e))
@@ -197,6 +221,7 @@ static ENV_OVERRIDES: &[EnvOverride] = &[
     EnvOverride {
         env_var: "RUST_LOG",
         config_path: "logging.level",
+        secret: false,
         apply: |config, value| {
             config.logging.level = value.to_string();
             Ok(())
@@ -205,6 +230,7 @@ static ENV_OVERRIDES: &[EnvOverride] = &[
     EnvOverride {
         env_var: "RELAY_SERVER_LOG_FORMAT",
         config_path: "logging.format",
+        secret: false,
         apply: |config, value| {
             config.logging.format = value.to_string();
             Ok(())
@@ -723,7 +749,7 @@ impl Config {
                 tracing::info!(
                     "Config override: {} = {} (from {})",
                     override_def.config_path,
-                    value,
+                    override_def.loggable(&value),
                     override_def.env_var
                 );
 
@@ -983,6 +1009,23 @@ mod tests {
     use super::*;
     use std::env;
     use std::sync::Mutex;
+
+    #[test]
+    fn env_overrides_carrying_credentials_are_not_logged() {
+        for name in ["RELAY_SERVER_AUTH", "RELAY_SERVER_WEBHOOK_CONFIG"] {
+            let def = ENV_OVERRIDES.iter().find(|o| o.env_var == name).unwrap();
+            assert_eq!(def.loggable("value-that-must-not-appear"), "<redacted>");
+        }
+    }
+
+    #[test]
+    fn env_overrides_without_credentials_are_logged() {
+        let def = ENV_OVERRIDES
+            .iter()
+            .find(|o| o.env_var == "RELAY_SERVER_HOST")
+            .unwrap();
+        assert_eq!(def.loggable("0.0.0.0"), "0.0.0.0");
+    }
 
     // Use a mutex to prevent tests from running concurrently and interfering with each other
     static TEST_MUTEX: Mutex<()> = Mutex::new(());
